@@ -31,17 +31,41 @@ echo -e "${PLAIN}"
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-echo -e "正在安装依赖..."
-/usr/bin/apt-get update -qq
-/usr/bin/apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools
+# 检测包管理器
+if command -v apt-get &>/dev/null; then
+    PKG_MANAGER="apt"
+elif command -v apk &>/dev/null; then
+    PKG_MANAGER="apk"
+else
+    error "不支持的系统，仅支持 Ubuntu/Debian/Alpine"
+fi
 
-# 安装 microsocks
+echo -e "正在安装依赖（$PKG_MANAGER）..."
+if [[ "$PKG_MANAGER" == "apt" ]]; then
+    apt-get update -qq
+    apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools
+elif [[ "$PKG_MANAGER" == "apk" ]]; then
+    apk update -q
+    apk add -q openvpn curl python3 iproute2 iptables net-tools
+fi
+
+# 安装 SOCKS5 代理（直接用包，不编译）
 if ! command -v microsocks &>/dev/null; then
-    /usr/bin/apt-get install -y -qq gcc make
-    cd /tmp
-    curl -sL https://github.com/rofl0r/microsocks/archive/refs/heads/master.tar.gz | tar xz
-    cd microsocks-master && make -s && make install -s
-    cd /
+    echo -e "正在安装 3proxy..."
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        apt-get install -y -qq 3proxy 2>/dev/null || \
+        apt-get install -y -qq dante-server 2>/dev/null || \
+        {
+            # 下载预编译二进制
+            echo "正在下载预编译 microsocks..."
+            curl -sL https://github.com/rofl0r/microsocks/releases/download/v1.0.4/microsocks-linux-x86_64 \
+                -o /usr/local/bin/microsocks 2>/dev/null && \
+            chmod +x /usr/local/bin/microsocks || \
+            error "无法安装 SOCKS5 代理，请手动安装 3proxy"
+        }
+    elif [[ "$PKG_MANAGER" == "apk" ]]; then
+        apk add -q 3proxy 2>/dev/null || error "无法安装 3proxy"
+    fi
 fi
 
 mkdir -p "$INSTALL_DIR"/{bin,ovpn,logs}
@@ -221,8 +245,22 @@ setup_routing() {
 }
 
 start_proxy() {
-    microsocks -i 127.0.0.1 -p $PROXY_PORT &
-    echo $! > "$INSTALL_DIR/microsocks.pid"
+    if command -v microsocks &>/dev/null; then
+        microsocks -i 127.0.0.1 -p $PROXY_PORT &
+        echo $! > "$INSTALL_DIR/microsocks.pid"
+    elif command -v 3proxy &>/dev/null; then
+        cat > /tmp/3proxy.cfg << EOF
+nserver 8.8.8.8
+nscache 65536
+log /dev/null
+socks -p$PROXY_PORT -i127.0.0.1 -e127.0.0.1
+EOF
+        3proxy /tmp/3proxy.cfg &
+        echo $! > "$INSTALL_DIR/microsocks.pid"
+    else
+        echo "错误：未找到可用的 SOCKS5 代理程序"
+        return 1
+    fi
     iptables -t mangle -A OUTPUT -p tcp --sport $PROXY_PORT -j MARK --set-mark $FWMARK 2>/dev/null || true
     iptables -t mangle -A OUTPUT -p tcp --dport $PROXY_PORT -j MARK --set-mark $FWMARK 2>/dev/null || true
 }
@@ -509,8 +547,72 @@ SVCEOF
 
 ln -sf "$INSTALL_DIR/bin/gateway.sh" /usr/local/bin/vpngw
 
-systemctl daemon-reload
-systemctl enable $SERVICE_NAME vpngate-rotate.timer
+# ── 服务注册 ──────────────────────────────────────────────────────────────────
+if command -v systemctl &>/dev/null; then
+    # systemd (Ubuntu/Debian)
+    cat > /etc/systemd/system/$SERVICE_NAME.service << SVCEOF
+[Unit]
+Description=VPNGate Gateway Service
+After=network.target
+
+[Service]
+Type=forking
+ExecStartPre=/usr/bin/python3 $INSTALL_DIR/bin/fetch_nodes.py --top 10
+ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh auto
+ExecStop=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh stop
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    cat > /etc/systemd/system/vpngate-rotate.service << SVCEOF
+[Unit]
+Description=VPNGate Node Rotation
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh rotate
+SVCEOF
+
+    cat > /etc/systemd/system/vpngate-rotate.timer << SVCEOF
+[Unit]
+Description=Rotate VPNGate node every 2 hours
+[Timer]
+OnBootSec=2h
+OnUnitActiveSec=2h
+[Install]
+WantedBy=timers.target
+SVCEOF
+
+    systemctl daemon-reload
+    systemctl enable $SERVICE_NAME vpngate-rotate.timer
+
+elif command -v rc-update &>/dev/null; then
+    # OpenRC (Alpine)
+    cat > /etc/init.d/$SERVICE_NAME << RCEOF
+#!/sbin/openrc-run
+description="VPNGate Gateway Service"
+command="/bin/sh"
+command_args="$INSTALL_DIR/bin/vpn_manager.sh auto"
+pidfile="/run/$SERVICE_NAME.pid"
+
+start_pre() {
+    python3 $INSTALL_DIR/bin/fetch_nodes.py --top 10
+}
+
+stop() {
+    /bin/sh $INSTALL_DIR/bin/vpn_manager.sh stop
+}
+RCEOF
+    chmod +x /etc/init.d/$SERVICE_NAME
+    rc-update add $SERVICE_NAME default
+
+    # Alpine 用 crond 实现轮换
+    echo "0 */2 * * * /bin/sh $INSTALL_DIR/bin/vpn_manager.sh rotate" | crontab -
+    rc-update add crond default
+    rc-service crond start 2>/dev/null || true
+fi
 
 echo -e "\n${GREEN}╔════════════════════════════════════╗${PLAIN}"
 echo -e "${GREEN}║        安装完成！                  ║${PLAIN}"

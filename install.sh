@@ -29,13 +29,15 @@ cat << 'BANNER'
 BANNER
 echo -e "${PLAIN}"
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 echo -e "正在安装依赖..."
-apt-get update -qq
-apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools
+/usr/bin/apt-get update -qq
+/usr/bin/apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools
 
 # 安装 microsocks
 if ! command -v microsocks &>/dev/null; then
-    apt-get install -y -qq gcc make
+    /usr/bin/apt-get install -y -qq gcc make
     cd /tmp
     curl -sL https://github.com/rofl0r/microsocks/archive/refs/heads/master.tar.gz | tar xz
     cd microsocks-master && make -s && make install -s

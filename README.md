@@ -28,7 +28,7 @@ VPNGate 节点（日本/美国/等）
 ## 安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/vpngate-gateway/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway/main/install.sh)
 ```
 
 ## 命令

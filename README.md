@@ -53,7 +53,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway
 | `vg set <key> <value>` | 修改设置 |
 | `vg uninstall` | 卸载 |
 
-
+```
 
 示例：
 
@@ -99,32 +99,6 @@ vg set top_nodes 30          # 保留前30个节点
 ```bash
 vg uninstall
 ```
-
-支持两种卸载方式：
-- **卸载服务**：删除服务和程序文件，保留 openvpn 等依赖，重新安装时无需重装依赖
-- **彻底卸载**：同时移除 openvpn、iproute2 等依赖包
-
-## 服务管理
-
-```bash
-vg restart                          # 重启服务
-systemctl status vpngate-gateway    # 查看服务状态
-journalctl -u vpngate-gateway -f    # 实时查看系统日志
-```
-
-## 常见问题
-
-**节点列表探测显示 ✘ 但能正常连接？**
-正常现象。VPNGate 节点的 OpenVPN 握手验证在没有 VPN 的环境下容易被防火墙拦截，不代表节点不可用。可以用 `vg set probe_count 0` 跳过验证，直接按延迟排序连接。
-
-**出口 IP 和节点 IP 不一样？**
-正常现象。VPNGate 节点本身是中继服务器，连接 IP 是节点的入口地址，出口 IP 是节点实际出网的地址，两者不同是正常的。
-
-**修改端口后代理不可用？**
-修改 `proxy_port` 后需要重启服务生效：`vg restart`，同时记得同步更新 Xray/3x-ui 里的端口配置。
-
-**512M 内存的机器能用吗？**
-可以。正常运行约占 150MB。首次抓取节点时内存会短暂升高，建议设置 `probe_count 5` 和 `top_nodes 15` 降低内存压力。
 
 ## 依赖
 

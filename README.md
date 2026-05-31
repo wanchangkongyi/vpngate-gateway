@@ -25,34 +25,8 @@ SSH / 管理流量始终走 eth0，与 tun0 路由表完全隔离。
 ## 快速安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/
-
-```
-## 架构
-
-```
-Xray / 3x-ui
-    │ SOCKS5 出站
-    ▼
-127.0.0.1:7928  ← HTTP/SOCKS5 双协议代理（proxy_server.py）
-    │ SO_BINDTODEVICE → tun0
-    ▼
-tun0  ← OpenVPN 虚拟网卡
-    │ 策略路由表 100（仅 tun0 出站流量走此表）
-    ▼
-VPNGate 公共节点（日本 / 美国 / 韩国 / ...）
-    │
-    ▼
-目标网站（看到 VPNGate 节点 IP，非 VPS 真实 IP）
-```
-
-SSH / 管理流量始终走 eth0，与 tun0 路由表完全隔离。
-
-## 快速安装
-
-```bash
 # 修改 install.sh 顶部的 GITHUB_REPO 为你的仓库后执行
-bash <(curl -Ls https://raw.githubusercontent.com/YOUR_USER/vpngate-gateway/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway/main/install.sh)
 ```
 
 ## 命令参考

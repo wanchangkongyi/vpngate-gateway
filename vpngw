@@ -1,290 +1,536 @@
 #!/usr/bin/env python3
 """
-HTTP/SOCKS5 双协议代理服务器
-所有出站连接通过 SO_BINDTODEVICE 强制绑定 tun0
-VPN 断开（tun0 不存在）时直接返回 502，不回落到真实 IP
+vpngw — VPNGate Gateway 命令行工具
+用法：
+  vpngw                     交互菜单
+  vpngw status              查看状态
+  vpngw fetch               抓取节点
+  vpngw fetch --country JP,US
+  vpngw fetch --top 30
+  vpngw auto                自动连接最快节点
+  vpngw auto JP             自动连接最快日本节点
+  vpngw nodes               查看节点列表
+  vpngw connect <node_id>   连接指定节点
+  vpngw rotate              轮换节点
+  vpngw stop                断开并停止
+  vpngw logs                查看日志
+  vpngw set <key> <value>   修改设置
 """
 from __future__ import annotations
-import select
-import socket
-import struct
-import threading
-import time
-import urllib.parse
+import argparse
+import json
 import os
-import logging
-from typing import Optional
+import shutil
+import sys
+import time
+from pathlib import Path
 
-log = logging.getLogger("proxy")
+# ── 路径 ──────────────────────────────────────────────────────────────────────
+INSTALL_DIR  = Path("/opt/vpngate-gateway")
+DATA_DIR     = INSTALL_DIR / "data"
+CMD_FILE     = DATA_DIR / "cmd.json"
+CMD_RESULT   = DATA_DIR / "cmd_result.json"
+NODES_FILE   = DATA_DIR / "nodes.json"
+STATE_FILE   = DATA_DIR / "state.json"
+LOG_FILE     = DATA_DIR / "vpngate.log"
+SETTINGS_FILE= DATA_DIR / "settings.json"
 
-BIND_DEVICE   = b"tun0"
-CONNECT_TIMEOUT = 20.0
-RELAY_TIMEOUT   = 300.0   # 5 分钟无数据后断开
+# ── 颜色 ──────────────────────────────────────────────────────────────────────
+_use_color = sys.stdout.isatty()
 
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _use_color else text
 
-# ── tun0 存在检查 ─────────────────────────────────────────────────────────────
-def _tun0_exists() -> bool:
-    """检查 tun0 是否存在且 UP"""
-    try:
-        with open("/proc/net/if_inet6") as _:
-            pass
-    except Exception:
-        pass
-    try:
-        # /sys/class/net/tun0/operstate
-        p = f"/sys/class/net/{BIND_DEVICE.decode()}/operstate"
-        return os.path.exists(p)
-    except Exception:
-        return False
+def red(t: str)    -> str: return _c("0;31", t)
+def green(t: str)  -> str: return _c("0;32", t)
+def yellow(t: str) -> str: return _c("1;33", t)
+def cyan(t: str)   -> str: return _c("0;36", t)
+def bold(t: str)   -> str: return _c("1", t)
+def dim(t: str)    -> str: return _c("2", t)
 
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise ConnectionError("连接提前关闭")
-        data += chunk
-    return data
-
-
-def _create_upstream(host: str, port: int, timeout: float = CONNECT_TIMEOUT) -> socket.socket:
-    """
-    创建出站 TCP 连接，强制绑定 tun0。
-    tun0 不存在时抛出 OSError（上层转为 502）。
-    """
-    if not _tun0_exists():
-        raise OSError("tun0 未就绪，VPN 未连接")
-
-    # 优先用系统解析器，回退到直接连接
-    addrs = []
+def _read_json(path: Path, default=None):
     try:
-        addrs = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    except socket.gaierror:
-        addrs = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (host, port))]
-
-    last_err: Exception = OSError("无可用地址")
-    for af, socktype, proto, _, sa in addrs:
-        s: Optional[socket.socket] = None
-        try:
-            s = socket.socket(af, socktype, proto)
-            s.settimeout(timeout)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, BIND_DEVICE)
-            s.connect(sa)
-            s.settimeout(None)   # 进入 relay 后用 select，不需要超时
-            return s
-        except OSError as e:
-            last_err = e
-            if s:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-    raise last_err
-
-
-# ── 双向中继 ──────────────────────────────────────────────────────────────────
-def _relay(left: socket.socket, right: socket.socket) -> None:
-    """
-    双向透传，任一端关闭或超时则退出。
-    """
-    sockets = [left, right]
-    try:
-        while True:
-            readable, _, errored = select.select(sockets, [], sockets, RELAY_TIMEOUT)
-            if errored or not readable:
-                return
-            for src in readable:
-                dst = right if src is left else left
-                try:
-                    data = src.recv(65536)
-                    if not data:
-                        return
-                    dst.sendall(data)
-                except OSError:
-                    return
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        pass
+        return default
 
 
-# ── SOCKS5 ────────────────────────────────────────────────────────────────────
-def _handle_socks5(client: socket.socket) -> None:
-    upstream: Optional[socket.socket] = None
-    try:
-        # 握手
-        n_methods = _recv_exact(client, 1)[0]
-        _recv_exact(client, n_methods)            # 忽略认证方法列表
-        client.sendall(b"\x05\x00")               # 无认证
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
-        # 请求
-        header = _recv_exact(client, 4)
-        ver, cmd, _, atype = header
-        if ver != 5:
-            return
-        if cmd != 1:                              # 只支持 CONNECT
-            client.sendall(b"\x05\x07\x00\x01" + b"\x00" * 6)
-            return
 
-        if atype == 0x01:                         # IPv4
-            host = socket.inet_ntoa(_recv_exact(client, 4))
-        elif atype == 0x03:                       # 域名
-            dlen = _recv_exact(client, 1)[0]
-            host = _recv_exact(client, dlen).decode("utf-8", errors="replace")
-        elif atype == 0x04:                       # IPv6
-            host = socket.inet_ntop(socket.AF_INET6, _recv_exact(client, 16))
+def _service_running() -> bool:
+    import subprocess
+    r = subprocess.run(
+        ["systemctl", "is-active", "vpngate-gateway"],
+        capture_output=True, text=True
+    )
+    return r.stdout.strip() == "active"
+
+
+# ── 命令总线发送 ──────────────────────────────────────────────────────────────
+def _send_cmd(cmd: str, args: list = [], timeout: int = 120) -> tuple[bool, str]:
+    """
+    写命令到 cmd.json，等待 cmd_result.json 更新。
+    返回 (ok, message)
+    """
+    if not DATA_DIR.exists():
+        return False, "数据目录不存在，服务可能未安装"
+
+    ts = time.time()
+    _write_json(CMD_FILE, {"cmd": cmd, "args": args, "ts": ts})
+
+    deadline = time.time() + timeout
+    spinner  = ["|", "/", "-", "\\"]
+    i        = 0
+    while time.time() < deadline:
+        time.sleep(0.3)
+        result = _read_json(CMD_RESULT, {})
+        if result.get("ts", 0) > ts:
+            return result.get("ok", False), result.get("msg", "")
+        if sys.stdout.isatty():
+            print(f"\r  {spinner[i % len(spinner)]} 等待响应...", end="", flush=True)
+            i += 1
+
+    if sys.stdout.isatty():
+        print()
+    return False, f"命令超时（{timeout}s）"
+
+
+# ── status ────────────────────────────────────────────────────────────────────
+def cmd_status(args) -> None:
+    state   = _read_json(STATE_FILE, {})
+    nodes   = _read_json(NODES_FILE, [])
+    active  = state.get("active_node_id", "")
+    message = state.get("message", "")
+    running = _service_running()
+
+    print()
+    print(bold("─" * 50))
+    print(bold("  VPNGate Gateway 状态"))
+    print(bold("─" * 50))
+
+    svc_text = green("● 运行中") if running else red("● 已停止")
+    print(f"  服务状态  {svc_text}")
+
+    if active:
+        node = next((n for n in nodes if n["id"] == active), None)
+        if node:
+            lat_color = green if node.get("latency_ms", 0) < 100 else yellow
+            print(f"  连接节点  {green(active)}")
+            print(f"  出口 IP   {cyan(node.get('ip',''))}")
+            print(f"  国家      {node.get('country', node.get('country_code',''))}")
+            print(f"  延迟      {lat_color(str(node.get('latency_ms','')))} ms")
+            print(f"  ISP       {dim(node.get('isp',''))}")
         else:
-            client.sendall(b"\x05\x08\x00\x01" + b"\x00" * 6)
-            return
+            print(f"  连接节点  {cyan(active)}")
+    else:
+        print(f"  连接节点  {yellow('未连接')}")
 
-        port = struct.unpack("!H", _recv_exact(client, 2))[0]
+    if message:
+        print(f"  消息      {dim(message)}")
 
-        try:
-            upstream = _create_upstream(host, port)
-        except OSError as e:
-            # tun0 不可用或连接失败 → Host unreachable (0x04)
-            log.warning(f"SOCKS5 上游连接失败 {host}:{port} — {e}")
-            client.sendall(b"\x05\x04\x00\x01" + b"\x00" * 6)
-            return
+    if state.get("connected_at"):
+        dt = time.time() - state["connected_at"]
+        h, m = int(dt // 3600), int((dt % 3600) // 60)
+        print(f"  连接时长  {h}h {m}m")
 
-        client.sendall(b"\x05\x00\x00\x01" + b"\x00" * 6)
-        _relay(client, upstream)
-    except Exception as e:
-        log.debug(f"SOCKS5 处理异常: {e}")
-    finally:
-        _safe_close(client)
-        _safe_close(upstream)
+    print(f"  节点数量  {len(nodes)} 个")
 
-
-# ── HTTP/HTTPS ────────────────────────────────────────────────────────────────
-def _handle_http(client: socket.socket, first_byte: bytes) -> None:
-    upstream: Optional[socket.socket] = None
-    try:
-        # 读完整请求头
-        buf = first_byte
-        client.settimeout(10)
-        while b"\r\n\r\n" not in buf and len(buf) < 65536:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        client.settimeout(None)
-
-        head, _, body = buf.partition(b"\r\n\r\n")
-        try:
-            head_str = head.decode("iso-8859-1")
-        except Exception:
-            return
-        lines = head_str.split("\r\n")
-        if not lines:
-            return
-
-        parts = lines[0].split(" ", 2)
-        if len(parts) < 2:
-            return
-        method, target = parts[0], parts[1]
-
-        if method.upper() == "CONNECT":
-            # HTTPS 隧道
-            host, _, port_s = target.rpartition(":")
-            port = int(port_s) if port_s.isdigit() else 443
-            try:
-                upstream = _create_upstream(host, port)
-            except OSError as e:
-                log.warning(f"CONNECT 上游失败 {target} — {e}")
-                _send_ignore(client, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                return
-            _send_ignore(client, b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if body:
-                _send_ignore(upstream, body)
-            _relay(client, upstream)
-            return
-
-        # 普通 HTTP 代理
-        parsed = urllib.parse.urlsplit(target)
-        if not parsed.hostname:
-            return
-        port   = parsed.port or 80
-        path   = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        # 过滤 Proxy- 头
-        fwd_headers = [
-            l for l in lines[1:]
-            if l and not l.lower().startswith(("proxy-connection:", "proxy-authorization:"))
-        ]
-        req = (
-            f"{method} {path} HTTP/1.1\r\n"
-            + "\r\n".join(fwd_headers)
-            + "\r\nConnection: close\r\n\r\n"
+    # 出口 IP 实时检测
+    if "--check" in sys.argv or getattr(args, "check", False):
+        print()
+        print("  正在检测出口 IP...", end="", flush=True)
+        import subprocess
+        result = subprocess.run(
+            ["curl", "-4", "-s", "--socks5-hostname", "127.0.0.1:7928",
+             "https://api.ipify.org", "--max-time", "8"],
+            capture_output=True, text=True, timeout=12
         )
-        try:
-            upstream = _create_upstream(parsed.hostname, port)
-        except OSError as e:
-            log.warning(f"HTTP 上游失败 {parsed.hostname}:{port} — {e}")
-            _send_ignore(client, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            return
-        upstream.sendall(req.encode("iso-8859-1") + body)
-        _relay(client, upstream)
-
-    except Exception as e:
-        log.debug(f"HTTP 处理异常: {e}")
-        _send_ignore(client, b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-    finally:
-        _safe_close(client)
-        _safe_close(upstream)
-
-
-# ── 分派 ──────────────────────────────────────────────────────────────────────
-def _handle_client(client: socket.socket) -> None:
-    try:
-        client.settimeout(15)
-        first = _recv_exact(client, 1)
-        client.settimeout(None)
-        if first == b"\x05":
-            _handle_socks5(client)
+        if result.returncode == 0 and result.stdout.strip():
+            print(f"\r  出口 IP   {green(result.stdout.strip())}    ")
         else:
-            _handle_http(client, first)
-    except Exception as e:
-        log.debug(f"客户端分派异常: {e}")
-        _safe_close(client)
+            print(f"\r  出口 IP   {red('检测失败（代理不可用）')}    ")
+
+    print(bold("─" * 50))
+    print()
 
 
-def _safe_close(s: Optional[socket.socket]) -> None:
-    if s is None:
+# ── fetch ─────────────────────────────────────────────────────────────────────
+def cmd_fetch(args) -> None:
+    cmd_args = []
+    country = getattr(args, "country", None)
+    top     = getattr(args, "top", None)
+    if country:
+        cmd_args.append(country)
+    if top:
+        cmd_args.append(str(top))
+
+    parts = []
+    if country:
+        parts.append(f"国家: {country}")
+    if top:
+        parts.append(f"前 {top} 个")
+    desc = "，".join(parts) if parts else "所有节点"
+    print(f"\n  正在抓取节点（{desc}）...\n")
+
+    ok, msg = _send_cmd("fetch", cmd_args, timeout=180)
+    _print_result(ok, msg)
+
+
+# ── nodes ─────────────────────────────────────────────────────────────────────
+def cmd_nodes(args) -> None:
+    nodes = _read_json(NODES_FILE, [])
+    if not nodes:
+        print(yellow("\n  暂无节点，请先执行 vpngw fetch\n"))
         return
+
+    country_filter = getattr(args, "country", None)
+    if country_filter:
+        nodes = [n for n in nodes if n.get("country_code") == country_filter.upper()]
+
+    limit = getattr(args, "limit", 30) or 30
+
+    col_w = shutil.get_terminal_size((120, 40)).columns
+    short = col_w < 100
+
+    print()
+    if short:
+        print(bold(f"  {'#':<3} {'国家':<6} {'IP':<15} {'延迟':>6} {'状态':<8}"))
+        print("  " + "─" * 44)
+    else:
+        print(bold(f"  {'#':<3} {'国家':<8} {'IP':<15} {'延迟':>6} {'探测':<8} {'ISP':<28} {'节点ID'}"))
+        print("  " + "─" * 90)
+
+    for i, n in enumerate(nodes[:limit], 1):
+        active    = n.get("active", False)
+        lat       = n.get("latency_ms", 0)
+        pstatus   = n.get("probe_status", "not_checked")
+        prefix    = green("▶ ") if active else "  "
+        lat_str   = (green if lat < 80 else yellow if lat < 200 else red)(f"{lat}ms")
+        probe_ico = {"available": green("✔"), "unavailable": red("✘"),
+                     "not_checked": dim("?")}.get(pstatus, "?")
+        country   = n.get("country") or n.get("country_code", "")
+
+        if short:
+            print(f"{prefix}{i:<3} {country:<6} {n['ip']:<15} {lat_str:>6} {probe_ico}")
+        else:
+            isp = (n.get("isp") or "")[:28]
+            nid = n["id"][:35]
+            print(f"{prefix}{i:<3} {country:<8} {n['ip']:<15} {lat_str:>6} {probe_ico:<8} {isp:<28} {dim(nid)}")
+
+    if len(nodes) > limit:
+        print(f"\n  {dim(f'（共 {len(nodes)} 个，显示前 {limit} 个，用 --limit N 调整）')}")
+    print()
+
+
+# ── auto ──────────────────────────────────────────────────────────────────────
+def cmd_auto(args) -> None:
+    country = getattr(args, "country", None)
+    label   = f"（{country}）" if country else ""
+    print(f"\n  正在自动选择最快节点{label}...\n")
+    cmd_args = [country] if country else []
+    ok, msg  = _send_cmd("auto_connect", cmd_args, timeout=60)
+    _print_result(ok, msg)
+    if ok:
+        cmd_status(args)
+
+
+# ── connect ───────────────────────────────────────────────────────────────────
+def cmd_connect(args) -> None:
+    node_id = args.node_id
+    print(f"\n  正在连接: {cyan(node_id)}\n")
+    ok, msg = _send_cmd("connect", [node_id], timeout=60)
+    _print_result(ok, msg)
+    if ok:
+        cmd_status(args)
+
+
+# ── rotate ────────────────────────────────────────────────────────────────────
+def cmd_rotate(args) -> None:
+    print("\n  正在切换节点...\n")
+    ok, msg = _send_cmd("rotate", timeout=60)
+    _print_result(ok, msg)
+    if ok:
+        cmd_status(args)
+
+
+# ── stop ──────────────────────────────────────────────────────────────────────
+def cmd_stop(args) -> None:
+    ok, msg = _send_cmd("disconnect")
+    _print_result(ok, msg)
+
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+def cmd_logs(args) -> None:
+    n = getattr(args, "lines", 50) or 50
+    if LOG_FILE.exists():
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+        print()
+        for line in lines[-n:]:
+            # 简单着色
+            if "失败" in line or "错误" in line or "Error" in line:
+                print(red(f"  {line}"))
+            elif "成功" in line or "已连接" in line or "启动" in line:
+                print(green(f"  {line}"))
+            elif "警告" in line or "超时" in line:
+                print(yellow(f"  {line}"))
+            else:
+                print(f"  {line}")
+        print()
+    else:
+        print(yellow("\n  日志文件不存在\n"))
+
+
+# ── set ───────────────────────────────────────────────────────────────────────
+_SETTING_HELP = {
+    "country_filter": "国家代码列表，逗号分隔（如 JP,US,KR），空字符串=不限",
+    "rotate_hours":   "自动轮换间隔（小时），0=关闭",
+    "top_nodes":      "保留节点数量（建议 10~50）",
+    "proxy_port":     "SOCKS5 代理监听端口（默认 7928）",
+    "probe_count":    "OpenVPN 握手验证节点数（越多越慢，建议 5~15）",
+    "auto_fetch_on_start": "启动时自动抓取节点（true/false）",
+}
+
+def cmd_set(args) -> None:
+    key   = args.key
+    value = args.value
+
+    settings = _read_json(SETTINGS_FILE, {})
+    defaults = {
+        "country_filter": [], "rotate_hours": 2, "top_nodes": 20,
+        "proxy_port": 7928, "probe_count": 10, "auto_fetch_on_start": True,
+    }
+    defaults.update(settings)
+
+    if key not in defaults:
+        print(red(f"\n  未知设置项: {key}"))
+        print(f"\n  可用设置项：")
+        for k, h in _SETTING_HELP.items():
+            print(f"    {cyan(k):<30} {h}")
+        print()
+        return
+
+    # 类型转换
+    old_val = defaults[key]
     try:
-        s.close()
-    except Exception:
-        pass
+        if isinstance(old_val, list):
+            new_val = [x.strip().upper() for x in value.split(",") if x.strip()] if value else []
+        elif isinstance(old_val, bool):
+            new_val = value.lower() in ("true", "1", "yes")
+        elif isinstance(old_val, int):
+            new_val = int(value)
+        elif isinstance(old_val, float):
+            new_val = float(value)
+        else:
+            new_val = value
+    except ValueError:
+        print(red(f"\n  值类型错误: 期望 {type(old_val).__name__}\n"))
+        return
+
+    defaults[key] = new_val
+    _write_json(SETTINGS_FILE, defaults)
+    print(green(f"\n  已保存: {key} = {new_val}\n"))
+    print(dim(f"  提示: 部分设置需要重启服务生效（systemctl restart vpngate-gateway）\n"))
 
 
-def _send_ignore(s: socket.socket, data: bytes) -> None:
-    try:
-        s.sendall(data)
-    except Exception:
-        pass
-
-
-# ── 入口 ──────────────────────────────────────────────────────────────────────
-def start_proxy_server(
-    host: str = "127.0.0.1",
-    port: int = 7928,
-    backlog: int = 256,
-) -> None:
-    """启动代理服务器（阻塞）"""
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(backlog)
-    print(f"[代理] HTTP/SOCKS5 监听 {host}:{port}", flush=True)
+# ── 交互菜单 ──────────────────────────────────────────────────────────────────
+def cmd_menu(_args=None) -> None:
+    import subprocess as sp
     while True:
-        try:
-            client, addr = server.accept()
-            threading.Thread(
-                target=_handle_client,
-                args=(client,),
-                daemon=True,
-                name=f"proxy-{addr[0]}:{addr[1]}",
-            ).start()
-        except Exception as e:
-            log.error(f"[代理] accept 异常: {e}")
-            time.sleep(0.5)
+        os.system("clear" if os.name == "posix" else "cls")
+        print(cyan("""
+ ╔══════════════════════════════════════════════╗
+ ║         VPNGate Gateway 管理菜单             ║
+ ╠══════════════════════════════════════════════╣
+ ║  1. 查看状态（含出口 IP 检测）               ║
+ ║  2. 抓取节点                                 ║
+ ║  3. 查看节点列表                             ║
+ ║  4. 自动连接最快节点                         ║
+ ║  5. 按国家连接                               ║
+ ║  6. 轮换节点                                 ║
+ ║  7. 手动选择节点                             ║
+ ║  8. 断开连接                                 ║
+ ║  9. 查看日志                                 ║
+ ║  0. 修改设置                                 ║
+ ║  q. 退出                                     ║
+ ╚══════════════════════════════════════════════╝"""))
+        print()
+        choice = input("  请选择 [0-9/q]: ").strip().lower()
+
+        class FakeArgs:
+            check  = True
+            limit  = 30
+            lines  = 50
+            country = None
+
+        fa = FakeArgs()
+
+        if choice == "1":
+            fa.check = True
+            cmd_status(fa)
+            input("  按 Enter 继续...")
+        elif choice == "2":
+            fa.country = input("  国家代码（留空=全部，如 JP,US）: ").strip() or None
+            top_s = input("  保留节点数（留空=默认）: ").strip()
+            fa.top = int(top_s) if top_s.isdigit() else None
+            cmd_fetch(fa)
+            input("  按 Enter 继续...")
+        elif choice == "3":
+            fa.country = input("  过滤国家（留空=全部）: ").strip() or None
+            limit_s = input("  显示数量（留空=30）: ").strip()
+            fa.limit = int(limit_s) if limit_s.isdigit() else 30
+            cmd_nodes(fa)
+            input("  按 Enter 继续...")
+        elif choice == "4":
+            cmd_auto(fa)
+            input("  按 Enter 继续...")
+        elif choice == "5":
+            fa.country = input("  国家代码（如 JP）: ").strip().upper() or None
+            cmd_auto(fa)
+            input("  按 Enter 继续...")
+        elif choice == "6":
+            cmd_rotate(fa)
+            input("  按 Enter 继续...")
+        elif choice == "7":
+            _menu_manual_connect()
+            input("  按 Enter 继续...")
+        elif choice == "8":
+            cmd_stop(fa)
+            input("  按 Enter 继续...")
+        elif choice == "9":
+            lines_s = input("  显示行数（留空=50）: ").strip()
+            fa.lines = int(lines_s) if lines_s.isdigit() else 50
+            cmd_logs(fa)
+            input("  按 Enter 继续...")
+        elif choice == "0":
+            _menu_settings()
+        elif choice in ("q", "quit", "exit"):
+            print()
+            break
+
+
+def _menu_manual_connect() -> None:
+    nodes = _read_json(NODES_FILE, [])
+    if not nodes:
+        print(yellow("  暂无节点，请先抓取"))
+        return
+
+    print()
+    for i, n in enumerate(nodes[:20], 1):
+        active = green("▶") if n.get("active") else " "
+        lat    = n.get("latency_ms", 0)
+        lat_s  = (green if lat < 100 else yellow)(f"{lat}ms")
+        print(f"  {active}{i:>2}. [{n.get('country_code','??')}] {n['ip']:<15} {lat_s:>6}  {n.get('country','')}")
+    print()
+    sel = input("  选择序号（留空=取消）: ").strip()
+    if sel.isdigit():
+        idx = int(sel) - 1
+        if 0 <= idx < min(20, len(nodes)):
+            node_id = nodes[idx]["id"]
+            print(f"\n  正在连接: {node_id}")
+            ok, msg = _send_cmd("connect", [node_id], timeout=60)
+            _print_result(ok, msg)
+
+
+def _menu_settings() -> None:
+    settings = _read_json(SETTINGS_FILE, {})
+    print()
+    print(bold("  当前设置："))
+    for k, h in _SETTING_HELP.items():
+        val = settings.get(k, "（默认）")
+        print(f"  {cyan(k):<30} = {yellow(str(val))}")
+        print(f"  {' ' * 30}   {dim(h)}")
+    print()
+    key = input("  要修改的设置项（留空=返回）: ").strip()
+    if not key:
+        return
+    val = input(f"  新值: ").strip()
+
+    class FakeArgs:
+        pass
+    fa = FakeArgs()
+    fa.key, fa.value = key, val
+    cmd_set(fa)
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+def _print_result(ok: bool, msg: str) -> None:
+    print()
+    if ok:
+        print(f"  {green('✔')} {msg}")
+    else:
+        print(f"  {red('✘')} {msg}")
+    print()
+
+
+# ── 主入口 ────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="vpngw",
+        description="VPNGate Gateway 命令行管理工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="subcmd")
+
+    # status
+    p_status = sub.add_parser("status", help="查看状态")
+    p_status.add_argument("--check", action="store_true", help="实时检测出口 IP")
+    p_status.set_defaults(func=cmd_status)
+
+    # fetch
+    p_fetch = sub.add_parser("fetch", help="抓取节点")
+    p_fetch.add_argument("--country", metavar="JP,US", help="国家代码（逗号分隔）")
+    p_fetch.add_argument("--top", type=int, metavar="N", help="保留前 N 个节点")
+    p_fetch.set_defaults(func=cmd_fetch)
+
+    # nodes
+    p_nodes = sub.add_parser("nodes", help="查看节点列表")
+    p_nodes.add_argument("--country", metavar="JP", help="过滤国家")
+    p_nodes.add_argument("--limit", type=int, default=30, metavar="N")
+    p_nodes.set_defaults(func=cmd_nodes)
+
+    # auto
+    p_auto = sub.add_parser("auto", help="自动连接最快节点")
+    p_auto.add_argument("country", nargs="?", help="国家代码（可选）")
+    p_auto.set_defaults(func=cmd_auto)
+
+    # connect
+    p_conn = sub.add_parser("connect", help="连接指定节点")
+    p_conn.add_argument("node_id", help="节点 ID（从 nodes 列表获取）")
+    p_conn.set_defaults(func=cmd_connect)
+
+    # rotate
+    p_rot = sub.add_parser("rotate", help="切换到下一个节点")
+    p_rot.set_defaults(func=cmd_rotate)
+
+    # stop
+    p_stop = sub.add_parser("stop", help="断开连接")
+    p_stop.set_defaults(func=cmd_stop)
+
+    # logs
+    p_logs = sub.add_parser("logs", help="查看日志")
+    p_logs.add_argument("-n", "--lines", type=int, default=50, metavar="N")
+    p_logs.set_defaults(func=cmd_logs)
+
+    # set
+    p_set = sub.add_parser("set", help="修改设置")
+    p_set.add_argument("key", help="设置项名称")
+    p_set.add_argument("value", help="新值")
+    p_set.set_defaults(func=cmd_set)
+
+    # 无子命令 → 交互菜单
+    args = parser.parse_args()
+    if args.subcmd is None:
+        cmd_menu()
+    else:
+        args.func(args)
+
+
+if __name__ == "__main__":
+    main()

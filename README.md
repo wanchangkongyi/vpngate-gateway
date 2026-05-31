@@ -25,7 +25,6 @@ SSH / 管理流量始终走 eth0，与 tun0 路由表完全隔离。
 ## 快速安装
 
 ```bash
-# 修改 install.sh 顶部的 GITHUB_REPO 为你的仓库后执行
 bash <(curl -Ls https://raw.githubusercontent.com/
 
 ```

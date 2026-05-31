@@ -1,629 +1,189 @@
 #!/bin/bash
-# VPNGate Gateway 一键安装脚本
-
 set -e
-
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; PLAIN='\033[0m'; BOLD='\033[1m'
-
-info()  { echo -e "${GREEN}[INFO]${PLAIN} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${PLAIN} $*"; }
-error() { echo -e "${RED}[ERROR]${PLAIN} $*"; exit 1; }
-
-[[ $EUID -ne 0 ]] && error "请用 root 权限运行: sudo bash install.sh"
-
-INSTALL_DIR="/opt/vpngate-gateway"
-SERVICE_NAME="vpngate-gateway"
-PROXY_PORT=7928
-
-echo -e "${CYAN}"
-cat << 'BANNER'
-  _   _______  _   _  _____       _
- | | | | ___ \| \ | ||  __ \     | |
- | | | | |_/ /|  \| || |  \/ __ _| |_ _____      ____ _ _   _
- | | | |  __/ | . ` || | __ / _` | __/ _ \ \ /\ / / _` | | | |
- \ \_/ / |    | |\  || |_\ \ (_| | ||  __/\ V  V / (_| | |_| |
-  \___/\_|    \_| \_/ \____/\__,_|\__\___| \_/\_/ \__,_|\__, |
-                                                          __/ |
-                                                         |___/
-BANNER
-echo -e "${PLAIN}"
-
+export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-# 检测包管理器
-if command -v apt-get &>/dev/null; then
-    PKG_MANAGER="apt"
-elif command -v apk &>/dev/null; then
-    PKG_MANAGER="apk"
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
+C='\033[0;36m'; B='\033[0;34m'; NC='\033[0m'; BOLD='\033[1m'
+
+[[ $EUID -ne 0 ]] && echo -e "${R}请用 root 权限运行${NC}" && exit 1
+
+echo -e "${B}"
+cat << 'EOF'
+ __   ____  _  _  ___  __  ____  ____     _  _  ___
+ \ \ / /  \| \| |/ __||  \| ___||  _ \   | \| ||_ _|
+  \ V /| () | .` | (_ || .` | _|  |   /   | .` | | |
+   \_/  \__/|_|\_|\___||_|\_|___| |_|_\   |_|\_||___|
+EOF
+echo -e "${NC}"
+
+INSTALL_DIR="/opt/vpngate-v2"
+GITHUB_URL="https://github.com/你的用户名/vpngate-v2.git"
+
+echo -e "${Y}[1/4] 安装依赖...${NC}"
+apt-get update -qq
+apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools git
+
+echo -e "${Y}[2/4] 部署源码...${NC}"
+if [ -d "$INSTALL_DIR" ]; then
+    cd "$INSTALL_DIR"
+    git fetch --all -q
+    git reset --hard origin/main -q 2>/dev/null || git reset --hard origin/master -q
 else
-    error "不支持的系统，仅支持 Ubuntu/Debian/Alpine"
+    git clone "$GITHUB_URL" "$INSTALL_DIR" -q
 fi
 
-echo -e "正在安装依赖（$PKG_MANAGER）..."
-if [[ "$PKG_MANAGER" == "apt" ]]; then
-    apt-get update -qq
-    apt-get install -y -qq openvpn curl python3 iproute2 iptables net-tools
-elif [[ "$PKG_MANAGER" == "apk" ]]; then
-    apk update -q
-    apk add -q openvpn curl python3 iproute2 iptables net-tools
-fi
+echo -e "${Y}[3/4] 配置服务...${NC}"
 
-# 安装 SOCKS5 代理（直接用包，不编译）
-if ! command -v microsocks &>/dev/null; then
-    echo -e "正在安装 3proxy..."
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        apt-get install -y -qq 3proxy 2>/dev/null || \
-        apt-get install -y -qq dante-server 2>/dev/null || \
-        {
-            # 下载预编译二进制
-            echo "正在下载预编译 microsocks..."
-            curl -sL https://github.com/rofl0r/microsocks/releases/download/v1.0.4/microsocks-linux-x86_64 \
-                -o /usr/local/bin/microsocks 2>/dev/null && \
-            chmod +x /usr/local/bin/microsocks || \
-            error "无法安装 SOCKS5 代理，请手动安装 3proxy"
-        }
-    elif [[ "$PKG_MANAGER" == "apk" ]]; then
-        apk add -q 3proxy 2>/dev/null || error "无法安装 3proxy"
-    fi
-fi
+# 数据目录
+mkdir -p "$INSTALL_DIR/data"
 
-mkdir -p "$INSTALL_DIR"/{bin,ovpn,logs}
+# systemd 服务
+cat > /lib/systemd/system/vpngate-v2.service << EOF2
+[Unit]
+Description=VPNGate Gateway v2
+After=network.target
 
-# ── 写认证文件 ────────────────────────────────────────────────────────────────
-echo -e "vpn\nvpn" > "$INSTALL_DIR/auth.txt"
-chmod 600 "$INSTALL_DIR/auth.txt"
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=/usr/bin/python3 $INSTALL_DIR/vpngate_manager.py
+Restart=always
+RestartSec=10
 
-# ── 节点抓取脚本 ──────────────────────────────────────────────────────────────
-cat > "$INSTALL_DIR/bin/fetch_nodes.py" << 'PYEOF'
+[Install]
+WantedBy=multi-user.target
+EOF2
+
+# 命令分发器（处理 vg 发出的命令）
+cat > "$INSTALL_DIR/cmd_handler.py" << 'PYEOF'
 #!/usr/bin/env python3
-import csv, io, base64, os, sys, json, re, socket, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.request import urlopen, Request
+"""后台命令处理线程，读取 cmd.json 并执行"""
+import json, os, sys, time, threading
+sys.path.insert(0, "/opt/vpngate-v2")
+import vpngate_manager as mgr
 
-API_URL   = "https://www.vpngate.net/api/iphone/"
-OVPN_DIR  = "/opt/vpngate-gateway/ovpn"
-NODE_FILE = "/opt/vpngate-gateway/nodes.json"
-HEADERS   = {"User-Agent": "Mozilla/5.0 (compatible; vpngate-gw/1.0)"}
+CMD_FILE    = mgr.DATA_DIR / "cmd.json"
+RESULT_FILE = mgr.DATA_DIR / "cmd_result.json"
+_last_ts    = 0.0
 
-def fetch_raw():
-    req = Request(API_URL, headers=HEADERS)
-    with urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", errors="replace")
-
-def extract_port(b64):
+def handle(cmd: dict):
+    global _last_ts
+    ts = cmd.get("ts", 0)
+    if ts <= _last_ts:
+        return
+    _last_ts = ts
+    action = cmd.get("cmd", "")
+    args   = cmd.get("args", [])
+    ok, msg = False, "未知命令"
     try:
-        cfg = base64.b64decode(b64).decode("utf-8", errors="replace")
-        lines = cfg.splitlines()
-        ports = []
-        for line in lines:
-            m = re.match(r'^remote\s+\S+\s+(\d+)', line.strip())
-            if m:
-                ports.append(int(m.group(1)))
-        if not ports:
-            return 443
-        unique = list(dict.fromkeys(ports))
-        if len(unique) == 1:
-            return unique[0]
-        udp = {1194,1195,1196,1197,1198}
-        tcp = [p for p in unique if p not in udp]
-        return tcp[0] if tcp else ports[0]
-    except:
-        return 443
+        if action == "auto_connect":
+            ok, msg = mgr.auto_connect()
+        elif action == "connect" and args:
+            ok, msg = mgr.connect_node(args[0])
+        elif action == "rotate":
+            ok, msg = mgr.rotate_node()
+        elif action == "disconnect":
+            mgr.disconnect()
+            ok, msg = True, "已断开"
+    except Exception as e:
+        msg = str(e)
+    mgr._write_json(RESULT_FILE, {"cmd": action, "ok": ok, "msg": msg, "ts": time.time()})
 
-def ping_host(ip, port=443, timeout=3):
-    try:
-        start = time.time()
-        s = socket.create_connection((ip, port), timeout=timeout)
-        s.close()
-        return int((time.time() - start) * 1000)
-    except:
-        return 9999
-
-def parse_nodes(raw, country_filter=None):
-    lines = [l for l in raw.splitlines() if not l.startswith("*")]
-    reader = csv.DictReader(io.StringIO("\n".join(lines)))
-    nodes = []
-    for row in reader:
-        cc = row.get("CountryShort","").strip().upper()
-        if country_filter and cc not in country_filter:
-            continue
-        hostname = row.get("#HostName","").strip()
-        ip       = row.get("IP","").strip()
-        b64      = row.get("OpenVPN_ConfigData_Base64","").strip()
-        if not hostname or not ip or not b64:
-            continue
-        if "." not in hostname:
-            hostname += ".opengw.net"
-        port  = extract_port(b64)
-        speed = int(row.get("Speed", 0) or 0)
-        nodes.append({
-            "hostname": hostname, "ip": ip, "port": port,
-            "country": cc, "speed": speed, "b64": b64, "ping": 9999,
-        })
-    return nodes
-
-def test_nodes(nodes, workers=30):
-    def _test(node):
-        node["ping"] = ping_host(node["ip"], node["port"])
-        return node
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_test, n): n for n in nodes}
-        results = [f.result() for f in as_completed(futures)]
-    return results
-
-def save_ovpn(node):
-    cfg = base64.b64decode(node["b64"]).decode("utf-8", errors="replace")
-    cfg = re.sub(
-        r'^(remote\s+)\S+(\s+\d+)',
-        lambda m: m.group(1) + node["hostname"] + m.group(2).rstrip(),
-        cfg, flags=re.MULTILINE
-    )
-    cfg += "\nauth-user-pass /opt/vpngate-gateway/auth.txt\n"
-    cfg += "script-security 2\n"
-    fname = f"{node['country']}_{node['hostname'].split('.')[0]}.ovpn"
-    path  = os.path.join(OVPN_DIR, fname)
-    with open(path, "w") as f:
-        f.write(cfg)
-    node["ovpn_file"] = path
-    return node
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--country", help="国家代码，逗号分隔")
-    parser.add_argument("--top", type=int, default=20)
-    parser.add_argument("--no-ping", action="store_true")
-    args = parser.parse_args()
-
-    country_filter = [c.strip().upper() for c in args.country.split(",")] if args.country else None
-
-    print(f"  正在抓取节点列表...")
-    raw   = fetch_raw()
-    nodes = parse_nodes(raw, country_filter)
-    print(f"  获取到 {len(nodes)} 个节点")
-
-    if not args.no_ping:
-        print(f"  并发测试延迟（{min(30,len(nodes))} 线程）...")
-        nodes = test_nodes(nodes)
-        nodes = [n for n in nodes if n["ping"] < 5000]
-        nodes.sort(key=lambda x: x["ping"])
-    else:
-        nodes.sort(key=lambda x: -x["speed"])
-
-    nodes = nodes[:args.top]
-
-    for f in os.listdir(OVPN_DIR):
-        if f.endswith(".ovpn"):
-            os.remove(os.path.join(OVPN_DIR, f))
-
-    for n in nodes:
-        save_ovpn(n)
-
-    saved = []
-    for n in nodes:
-        ping_str = f"{n['ping']}ms" if n['ping'] < 9999 else "N/A"
-        speed_str = f"{n['speed']//1000000}Mbps"
-        print(f"  [{n['country']}] {n['hostname']}  {ping_str}  {speed_str}")
-        del n["b64"]
-        saved.append(n)
-
-    with open(NODE_FILE, "w") as f:
-        json.dump(saved, f, indent=2)
-    print(f"\n  已保存 {len(saved)} 个节点")
+def loop():
+    while True:
+        time.sleep(0.3)
+        try:
+            if CMD_FILE.exists():
+                cmd = json.loads(CMD_FILE.read_text())
+                handle(cmd)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    main()
+    loop()
 PYEOF
 
-# ── VPN 连接管理 ──────────────────────────────────────────────────────────────
-cat > "$INSTALL_DIR/bin/vpn_manager.sh" << 'BASHEOF'
-#!/bin/bash
-INSTALL_DIR="/opt/vpngate-gateway"
-PROXY_PORT=7928
-ROUTE_TABLE=100
-FWMARK=0x1
-TUN_DEV="tun0"
-CURRENT_FILE="$INSTALL_DIR/current_node"
+# 把命令处理器集成到 manager 里
+cat >> "$INSTALL_DIR/vpngate_manager.py" << 'PYEOF'
 
-stop_vpn() {
-    pkill -f "openvpn.*vpngate" 2>/dev/null || true
-    pkill microsocks 2>/dev/null || true
-    ip rule del fwmark $FWMARK table $ROUTE_TABLE 2>/dev/null || true
-    ip route flush table $ROUTE_TABLE 2>/dev/null || true
-    iptables -t mangle -F OUTPUT 2>/dev/null || true
-    sleep 1
-}
+# 启动命令处理线程
+import importlib.util as _iu, threading as _th
+def _start_cmd_handler():
+    import sys as _sys
+    _sys.path.insert(0, "/opt/vpngate-v2")
+    try:
+        import cmd_handler
+        _th.Thread(target=cmd_handler.loop, daemon=True).start()
+    except Exception as e:
+        log(f"[命令处理] 启动失败: {e}")
 
-setup_routing() {
-    ip rule add fwmark $FWMARK table $ROUTE_TABLE 2>/dev/null || true
-    for i in $(seq 1 20); do
-        ip link show $TUN_DEV &>/dev/null && break
-        sleep 1
-    done
-    ip route add default dev $TUN_DEV table $ROUTE_TABLE 2>/dev/null || true
-}
+# 在 init() 里调用
+_orig_init = init
+def init():
+    _orig_init()
+    _start_cmd_handler()
+PYEOF
 
-start_proxy() {
-    if command -v microsocks &>/dev/null; then
-        microsocks -i 127.0.0.1 -p $PROXY_PORT &
-        echo $! > "$INSTALL_DIR/microsocks.pid"
-    elif command -v 3proxy &>/dev/null; then
-        cat > /tmp/3proxy.cfg << EOF
-nserver 8.8.8.8
-nscache 65536
-log /dev/null
-socks -p$PROXY_PORT -i127.0.0.1 -e127.0.0.1
-EOF
-        3proxy /tmp/3proxy.cfg &
-        echo $! > "$INSTALL_DIR/microsocks.pid"
-    else
-        echo "错误：未找到可用的 SOCKS5 代理程序"
-        return 1
-    fi
-    iptables -t mangle -A OUTPUT -p tcp --sport $PROXY_PORT -j MARK --set-mark $FWMARK 2>/dev/null || true
-    iptables -t mangle -A OUTPUT -p tcp --dport $PROXY_PORT -j MARK --set-mark $FWMARK 2>/dev/null || true
-}
+# vg 命令
+cp "$INSTALL_DIR/vg" /usr/local/bin/vg
+chmod +x /usr/local/bin/vg
+chmod +x "$INSTALL_DIR"/*.py
 
-connect() {
-    local ovpn_file="$1"
-    [[ -z "$ovpn_file" || ! -f "$ovpn_file" ]] && { echo "文件不存在: $ovpn_file"; return 1; }
-    stop_vpn
-    openvpn --config "$ovpn_file" \
-            --daemon vpngate \
-            --log "$INSTALL_DIR/logs/openvpn.log" \
-            --route-noexec \
-            --script-security 2
-    setup_routing
-    start_proxy
-    echo "$ovpn_file" > "$CURRENT_FILE"
-}
+systemctl daemon-reload
+systemctl enable vpngate-v2 --quiet
 
-auto_connect() {
-    local country="${1:-}"
-    if [[ -n "$country" ]]; then
-        ovpn_files=($(ls "$INSTALL_DIR/ovpn"/${country^^}_*.ovpn 2>/dev/null))
-    else
-        ovpn_files=($(ls "$INSTALL_DIR/ovpn"/*.ovpn 2>/dev/null))
-    fi
-    [[ ${#ovpn_files[@]} -eq 0 ]] && { echo "没有可用节点"; return 1; }
-    connect "${ovpn_files[0]}"
-}
+echo -e "${Y}[4/4] 初始化配置...${NC}"
 
-rotate() {
-    ovpn_files=($(ls "$INSTALL_DIR/ovpn"/*.ovpn 2>/dev/null))
-    [[ ${#ovpn_files[@]} -eq 0 ]] && { echo "没有可用节点"; return 1; }
-    current=$(cat "$CURRENT_FILE" 2>/dev/null || echo "")
-    next=""
-    found=false
-    for f in "${ovpn_files[@]}"; do
-        if $found; then next="$f"; break; fi
-        [[ "$f" == "$current" ]] && found=true
-    done
-    [[ -z "$next" ]] && next="${ovpn_files[0]}"
-    connect "$next"
-}
+# 询问初始设置
+echo ""
+echo -e "${C}── 初始化设置 ──────────────────────────────${NC}"
+read -p "国家过滤（如 JP,US,KR，留空=不限）: " cc_input
+read -p "自动轮换间隔（小时，0=关闭，默认2）: " rot_input
+read -p "保留节点数量（默认20）: " top_input
 
-case "${1:-}" in
-    connect)  connect "$2" ;;
-    auto)     auto_connect "${2:-}" ;;
-    rotate)   rotate ;;
-    stop)     stop_vpn ;;
-esac
-BASHEOF
-
-# ── 主菜单命令（3x-ui 风格）──────────────────────────────────────────────────
-cat > "$INSTALL_DIR/bin/gateway.sh" << 'BASHEOF'
-#!/bin/bash
-
-INSTALL_DIR="/opt/vpngate-gateway"
-NODE_FILE="$INSTALL_DIR/nodes.json"
-PROXY_PORT=7928
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-PLAIN='\033[0m'
-BOLD='\033[1m'
-
-# 获取当前状态信息
-get_status() {
-    # tun0
-    if ip link show tun0 &>/dev/null 2>&1; then
-        VPN_STATUS="${GREEN}已连接${PLAIN}"
-    else
-        VPN_STATUS="${RED}未连接${PLAIN}"
-    fi
-
-    # 当前节点
-    if [[ -f "$INSTALL_DIR/current_node" ]]; then
-        cur=$(cat "$INSTALL_DIR/current_node")
-        CURRENT_NODE=$(basename "$cur" .ovpn)
-    else
-        CURRENT_NODE="无"
-    fi
-
-    # 代理
-    if ss -tlnp 2>/dev/null | grep -q ":$PROXY_PORT "; then
-        PROXY_STATUS="${GREEN}运行中${PLAIN}  127.0.0.1:$PROXY_PORT"
-    else
-        PROXY_STATUS="${RED}未运行${PLAIN}"
-    fi
-
-    # 出口 IP
-    OUT_IP=$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null || echo "获取失败")
-}
-
-# 显示主菜单
-show_menu() {
-    get_status
-    clear
-    echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${BOLD}${BLUE}║        VPNGate Gateway 管理面板            ║${PLAIN}"
-    echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════╣${PLAIN}"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  VPN 状态  : $VPN_STATUS"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  当前节点  : ${CYAN}$CURRENT_NODE${PLAIN}"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  代理状态  : $PROXY_STATUS"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  出口 IP   : ${YELLOW}$OUT_IP${PLAIN}"
-    echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════╣${PLAIN}"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}0.${PLAIN}  退出"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}1.${PLAIN}  抓取节点（全部）"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}2.${PLAIN}  抓取节点（指定国家）"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}3.${PLAIN}  查看节点列表"
-    echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════╣${PLAIN}"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}4.${PLAIN}  自动连接最快节点"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}5.${PLAIN}  指定国家连接"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}6.${PLAIN}  手动选择节点"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}7.${PLAIN}  轮换下一个节点"
-    echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════╣${PLAIN}"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${GREEN}8.${PLAIN}  查看 OpenVPN 日志"
-    echo -e "${BOLD}${BLUE}║${PLAIN}  ${RED}9.${PLAIN}  停止服务"
-    echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════╝${PLAIN}"
-    echo -en "  请输入选项 [0-9]: "
-}
-
-# 显示节点列表
-show_nodes() {
-    [[ ! -f "$NODE_FILE" ]] && echo -e "  ${YELLOW}节点列表为空，请先抓取节点（选项1）${PLAIN}" && return
-    echo ""
-    echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════════════╗${PLAIN}"
-    echo -e "${BOLD}${BLUE}║  序号   国家   主机名                          延迟    速度  ║${PLAIN}"
-    echo -e "${BOLD}${BLUE}╠════════════════════════════════════════════════════════════╣${PLAIN}"
-    python3 -c "
-import json
-with open('$NODE_FILE') as f:
-    nodes = json.load(f)
-for i, n in enumerate(nodes, 1):
-    ping  = f\"{n['ping']}ms\" if n['ping'] < 9999 else 'N/A'
-    speed = f\"{n['speed']//1000000}Mbps\"
-    name  = n['hostname'].split('.')[0][:35]
-    print(f\"\033[0;34m║\033[0m  {i:3}.  [{n['country']:2}]  {name:<36} {ping:>6}  {speed:>6}  \033[0;34m║\033[0m\")
-"
-    echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════════════════════╝${PLAIN}"
-}
-
-# 手动选择节点
-select_node() {
-    show_nodes
-    [[ ! -f "$NODE_FILE" ]] && return
-    echo ""
-    echo -en "  请输入节点编号: "
-    read num
-    [[ -z "$num" || ! "$num" =~ ^[0-9]+$ ]] && echo "  无效输入" && return
-    file=$(python3 -c "
-import json
-with open('$NODE_FILE') as f:
-    nodes = json.load(f)
-idx = int('$num') - 1
-if 0 <= idx < len(nodes):
-    print(nodes[idx].get('ovpn_file',''))
-" 2>/dev/null)
-    if [[ -n "$file" && -f "$file" ]]; then
-        echo -e "  ${CYAN}正在连接: $(basename $file)${PLAIN}"
-        bash "$INSTALL_DIR/bin/vpn_manager.sh" connect "$file"
-        echo -e "  ${GREEN}连接成功！${PLAIN}"
-    else
-        echo -e "  ${RED}节点文件不存在，请重新抓取节点${PLAIN}"
-    fi
-}
-
-# 主循环
-main() {
-    while true; do
-        show_menu
-        read choice
-        echo ""
-        case "$choice" in
-            0)
-                echo -e "  ${GREEN}再见！${PLAIN}"
-                exit 0
-                ;;
-            1)
-                echo -e "  ${CYAN}正在抓取全部节点...${PLAIN}"
-                python3 "$INSTALL_DIR/bin/fetch_nodes.py"
-                ;;
-            2)
-                echo -en "  请输入国家代码（如 JP,US,KR）: "
-                read cc
-                echo -e "  ${CYAN}正在抓取 $cc 节点...${PLAIN}"
-                python3 "$INSTALL_DIR/bin/fetch_nodes.py" --country "$cc"
-                ;;
-            3)
-                show_nodes
-                ;;
-            4)
-                echo -e "  ${CYAN}正在连接最快节点...${PLAIN}"
-                bash "$INSTALL_DIR/bin/vpn_manager.sh" auto
-                echo -e "  ${GREEN}连接成功！代理: 127.0.0.1:$PROXY_PORT${PLAIN}"
-                ;;
-            5)
-                echo -en "  请输入国家代码（如 JP）: "
-                read cc
-                echo -e "  ${CYAN}正在连接 $cc 节点...${PLAIN}"
-                bash "$INSTALL_DIR/bin/vpn_manager.sh" auto "$cc"
-                echo -e "  ${GREEN}连接成功！${PLAIN}"
-                ;;
-            6)
-                select_node
-                ;;
-            7)
-                echo -e "  ${CYAN}正在轮换节点...${PLAIN}"
-                bash "$INSTALL_DIR/bin/vpn_manager.sh" rotate
-                echo -e "  ${GREEN}已切换到下一个节点${PLAIN}"
-                ;;
-            8)
-                echo -e "  ${CYAN}OpenVPN 日志（按 q 退出）:${PLAIN}"
-                tail -50 "$INSTALL_DIR/logs/openvpn.log" 2>/dev/null | less
-                ;;
-            9)
-                echo -e "  ${YELLOW}正在停止服务...${PLAIN}"
-                bash "$INSTALL_DIR/bin/vpn_manager.sh" stop
-                echo -e "  ${GREEN}已停止${PLAIN}"
-                ;;
-            *)
-                echo -e "  ${RED}无效选项，请输入 0-9${PLAIN}"
-                ;;
-        esac
-        echo ""
-        echo -en "  按 Enter 返回菜单..."
-        read
-    done
-}
-
-# 支持直接带参数执行，不进菜单
-case "${1:-}" in
-    status)
-        get_status
-        echo -e "VPN: $VPN_STATUS | 节点: $CURRENT_NODE | 代理: $PROXY_STATUS | 出口IP: $OUT_IP"
-        ;;
-    fetch)  shift; python3 "$INSTALL_DIR/bin/fetch_nodes.py" "$@" ;;
-    auto)   bash "$INSTALL_DIR/bin/vpn_manager.sh" auto "${2:-}" ;;
-    rotate) bash "$INSTALL_DIR/bin/vpn_manager.sh" rotate ;;
-    stop)   bash "$INSTALL_DIR/bin/vpn_manager.sh" stop ;;
-    "")     main ;;
-    *)      echo "用法: vpngw {status|fetch|auto [国家]|rotate|stop} 或直接输入 vpngw 进入菜单" ;;
-esac
-BASHEOF
-
-chmod +x "$INSTALL_DIR/bin/"*.sh "$INSTALL_DIR/bin/"*.py
-
-# ── systemd 服务 ──────────────────────────────────────────────────────────────
-cat > /etc/systemd/system/$SERVICE_NAME.service << SVCEOF
-[Unit]
-Description=VPNGate Gateway Service
-After=network.target
-
-[Service]
-Type=forking
-ExecStartPre=/usr/bin/python3 $INSTALL_DIR/bin/fetch_nodes.py --top 10
-ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh auto
-ExecStop=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh stop
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-cat > /etc/systemd/system/vpngate-rotate.service << SVCEOF
-[Unit]
-Description=VPNGate Node Rotation
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh rotate
-SVCEOF
-
-cat > /etc/systemd/system/vpngate-rotate.timer << SVCEOF
-[Unit]
-Description=Rotate VPNGate node every 2 hours
-[Timer]
-OnBootSec=2h
-OnUnitActiveSec=2h
-[Install]
-WantedBy=timers.target
-SVCEOF
-
-ln -sf "$INSTALL_DIR/bin/gateway.sh" /usr/local/bin/vpngw
-
-# ── 服务注册 ──────────────────────────────────────────────────────────────────
-if command -v systemctl &>/dev/null; then
-    # systemd (Ubuntu/Debian)
-    cat > /etc/systemd/system/$SERVICE_NAME.service << SVCEOF
-[Unit]
-Description=VPNGate Gateway Service
-After=network.target
-
-[Service]
-Type=forking
-ExecStartPre=/usr/bin/python3 $INSTALL_DIR/bin/fetch_nodes.py --top 10
-ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh auto
-ExecStop=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh stop
-Restart=on-failure
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    cat > /etc/systemd/system/vpngate-rotate.service << SVCEOF
-[Unit]
-Description=VPNGate Node Rotation
-[Service]
-Type=oneshot
-ExecStart=/bin/bash $INSTALL_DIR/bin/vpn_manager.sh rotate
-SVCEOF
-
-    cat > /etc/systemd/system/vpngate-rotate.timer << SVCEOF
-[Unit]
-Description=Rotate VPNGate node every 2 hours
-[Timer]
-OnBootSec=2h
-OnUnitActiveSec=2h
-[Install]
-WantedBy=timers.target
-SVCEOF
-
-    systemctl daemon-reload
-    systemctl enable $SERVICE_NAME vpngate-rotate.timer
-
-elif command -v rc-update &>/dev/null; then
-    # OpenRC (Alpine)
-    cat > /etc/init.d/$SERVICE_NAME << RCEOF
-#!/sbin/openrc-run
-description="VPNGate Gateway Service"
-command="/bin/sh"
-command_args="$INSTALL_DIR/bin/vpn_manager.sh auto"
-pidfile="/run/$SERVICE_NAME.pid"
-
-start_pre() {
-    python3 $INSTALL_DIR/bin/fetch_nodes.py --top 10
-}
-
-stop() {
-    /bin/sh $INSTALL_DIR/bin/vpn_manager.sh stop
-}
-RCEOF
-    chmod +x /etc/init.d/$SERVICE_NAME
-    rc-update add $SERVICE_NAME default
-
-    # Alpine 用 crond 实现轮换
-    echo "0 */2 * * * /bin/sh $INSTALL_DIR/bin/vpn_manager.sh rotate" | crontab -
-    rc-update add crond default
-    rc-service crond start 2>/dev/null || true
+CC_FILTER="[]"
+if [ -n "$cc_input" ]; then
+    CC_FILTER=$(python3 -c "
+import json, sys
+codes = [x.strip().upper() for x in '$cc_input'.split(',') if x.strip()]
+print(json.dumps(codes))
+")
 fi
+ROT_HOURS=${rot_input:-2}
+TOP_NODES=${top_input:-20}
 
-echo -e "\n${GREEN}╔════════════════════════════════════╗${PLAIN}"
-echo -e "${GREEN}║        安装完成！                  ║${PLAIN}"
-echo -e "${GREEN}╠════════════════════════════════════╣${PLAIN}"
-echo -e "${GREEN}║${PLAIN}  输入 ${BOLD}vpngw${PLAIN} 打开管理菜单          "
-echo -e "${GREEN}╚════════════════════════════════════╝${PLAIN}\n"
+python3 -c "
+import json
+s = {
+    'country_filter': $CC_FILTER,
+    'rotate_hours':   int('$ROT_HOURS'),
+    'top_nodes':      int('$TOP_NODES'),
+    'proxy_port':     7928,
+}
+import os; os.makedirs('/opt/vpngate-v2/data', exist_ok=True)
+with open('/opt/vpngate-v2/data/settings.json', 'w') as f:
+    json.dump(s, f, indent=2)
+print('设置已保存')
+"
 
-echo -en "是否立即启动并连接节点？[Y/n] "
-read ans
-if [[ "${ans:-Y}" =~ ^[Yy]$ ]]; then
-    bash "$INSTALL_DIR/bin/gateway.sh" fetch
-    bash "$INSTALL_DIR/bin/vpn_manager.sh" auto
-    bash "$INSTALL_DIR/bin/gateway.sh" status
+echo ""
+echo -e "${G}╔══════════════════════════════════════════╗${NC}"
+echo -e "${G}║          安装完成！                      ║${NC}"
+echo -e "${G}╠══════════════════════════════════════════╣${NC}"
+echo -e "${G}║${NC}  输入 ${BOLD}vg${NC} 打开交互管理菜单"
+echo -e "${G}║${NC}  ${C}vg status${NC}   查看状态"
+echo -e "${G}║${NC}  ${C}vg nodes${NC}    查看节点列表"
+echo -e "${G}║${NC}  ${C}vg auto${NC}     自动连接最快节点"
+echo -e "${G}║${NC}  ${C}vg rotate${NC}   轮换节点"
+echo -e "${G}║${NC}  ${C}vg logs${NC}     查看日志"
+echo -e "${G}║${NC}  SOCKS5代理: ${C}127.0.0.1:7928${NC}"
+echo -e "${G}╚══════════════════════════════════════════╝${NC}"
+echo ""
+
+read -p "是否立即启动服务？[Y/n] " start_now
+if [[ "${start_now:-Y}" =~ ^[Yy]$ ]]; then
+    systemctl start vpngate-v2
+    sleep 3
+    echo -e "${G}服务已启动，输入 vg 查看状态${NC}"
 fi

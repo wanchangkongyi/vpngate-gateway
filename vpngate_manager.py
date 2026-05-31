@@ -257,27 +257,45 @@ def fetch_and_test(
         _update_state(message=str(e), fetching=False)
         raise
 
-    nodes = vpn_utils.parse_nodes(raw, country_filter)
-    log(f"[抓取] 解析到 {len(nodes)} 个节点")
-    _update_state(message=f"正在测试 {len(nodes)} 个节点延迟...")
+    new_nodes = vpn_utils.parse_nodes(raw, country_filter)
+    log(f"[抓取] 解析到 {len(new_nodes)} 个新节点")
+
+    # 与现有列表合并去重（以 id 为唯一键，新节点覆盖旧节点配置，但保留旧节点的探测状态）
+    existing = get_nodes()
+    existing_map = {n["id"]: n for n in existing}
+    for n in new_nodes:
+        if n["id"] in existing_map:
+            # 新节点保留旧的探测状态，避免重复握手验证
+            old_n = existing_map[n["id"]]
+            n["probe_status"]  = old_n.get("probe_status", "not_checked")
+            n["probe_message"] = old_n.get("probe_message", "")
+            n["probed_at"]     = old_n.get("probed_at", 0.0)
+        existing_map[n["id"]] = n
+
+    # 合并后的全量节点（新抓到的 + 旧列表里新抓未覆盖的）
+    merged = list(existing_map.values())
+    log(f"[合并] 合并后共 {len(merged)} 个节点（含旧列表 {len(existing)} 个）")
+    _update_state(message=f"正在测试 {len(merged)} 个节点延迟...")
 
     def _do_latency(n: dict) -> dict:
         n["latency_ms"] = vpn_utils.tcp_latency(n["ip"], n["port"])
         return n
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
-        nodes = list(ex.map(_do_latency, nodes))
+        merged = list(ex.map(_do_latency, merged))
 
+    # 删除不可达节点，按延迟排序，保留前 top 个
     reachable = sorted(
-        [n for n in nodes if n["latency_ms"] > 0],
+        [n for n in merged if n["latency_ms"] > 0],
         key=lambda n: n["latency_ms"]
     )[:top]
-    unreachable_count = len(nodes) - len([n for n in nodes if n["latency_ms"] > 0])
-    log(f"[测速] 可达 {len(reachable)} 个（不可达 {unreachable_count} 个），保留前 {top} 个")
+    removed = len(merged) - len([n for n in merged if n["latency_ms"] > 0])
+    log(f"[测速] 删除不可达 {removed} 个，保留 {len(reachable)} 个")
     _update_state(message=f"正在验证 {min(probe_count, len(reachable))} 个节点可用性...")
 
-    # 并发 OpenVPN 握手验证，验证失败的直接剔除
-    check_n = min(probe_count, len(reachable))
+    # 并发 OpenVPN 握手验证（只验证 not_checked 的节点，已有结果的跳过）
+    to_probe = [n for n in reachable[:probe_count] if n.get("probe_status") == "not_checked"]
+    check_n = len(to_probe)
 
     def _do_probe(n: dict) -> dict:
         ok, msg = vpn_utils.test_openvpn(n["config_text"])
@@ -289,14 +307,20 @@ def fetch_and_test(
     if check_n > 0:
         workers = min(check_n, 5)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            probed = list(ex.map(_do_probe, reachable[:check_n]))
-        reachable[:check_n] = probed
+            probed = list(ex.map(_do_probe, to_probe))
+        # 把验证结果写回 reachable
+        probed_map = {n["id"]: n for n in probed}
+        reachable = [probed_map.get(n["id"], n) for n in reachable]
         available = sum(1 for n in probed if n["probe_status"] == "available")
         log(f"[握手] 验证完成：{available}/{check_n} 个可用")
 
-    # 剔除握手失败的节点，只保留 available 和 not_checked
-    reachable = [n for n in reachable if n.get("probe_status") != "unavailable"]
-    log(f"[筛选] 剔除不可用节点后剩余 {len(reachable)} 个")
+        if available > 0:
+            reachable = [n for n in reachable if n.get("probe_status") != "unavailable"]
+            log(f"[筛选] 剔除不可用节点后剩余 {len(reachable)} 个")
+        else:
+            log(f"[筛选] 握手全部失败，保留全部 {len(reachable)} 个节点")
+    else:
+        log(f"[握手] 所有节点已有探测结果，跳过验证")
 
     vpn_utils.enrich_ip(reachable)
     save_nodes(reachable)

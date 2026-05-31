@@ -1,4 +1,4 @@
-# VPNGate Gateway v2
+# VPNGate Gateway
 
 将 [VPNGate](https://www.vpngate.net) 免费公共节点作为 VPS 出口 IP，本地暴露 SOCKS5/HTTP 双协议代理供 Xray/3x-ui 使用。出口 IP 持续轮换，SSH 管理流量走 eth0 物理网卡，**不会断连**。
 
@@ -26,9 +26,7 @@ SSH / 管理流量始终走 eth0，与 tun0 路由表完全隔离。
 
 ```bash
 # 修改 install.sh 顶部的 GITHUB_REPO 为你的仓库后执行
-bash <(curl -Ls https://raw.githubusercontent.com/# VPNGate Gateway v2
-
-将 [VPNGate](https://www.vpngate.net) 免费公共节点作为 VPS 出口 IP，本地暴露 SOCKS5/HTTP 双协议代理供 Xray/3x-ui 使用。出口 IP 持续轮换，SSH 管理流量走 eth0 物理网卡，**不会断连**。
+bash <(curl -Ls https://raw.githubusercontent.com/
 
 ## 架构
 

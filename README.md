@@ -2,23 +2,6 @@
 
 将 [VPNGate](https://www.vpngate.net) 免费公共节点作为 VPS 出口 IP，本地暴露 SOCKS5/HTTP 双协议代理供 Xray/3x-ui 或其他工具使用。出口 IP 每隔一段时间自动轮换，SSH 管理流量走 eth0 物理网卡，**不会因切换 VPN 而断连**。
 
-## 架构
-
-```
-Xray / 3x-ui
-    │ SOCKS5 出站
-    ▼
-127.0.0.1:7928  ← HTTP/SOCKS5 双协议代理
-    │ SO_BINDTODEVICE → tun0（VPN 断开时直接返回 502，不泄露真实 IP）
-    ▼
-tun0  ← OpenVPN 虚拟网卡
-    │ 策略路由表 100
-    ▼
-VPNGate 公共节点（日本 / 美国 / 韩国 / ...）
-    │
-    ▼
-目标网站（看到 VPNGate 节点 IP，非 VPS 真实 IP）
-```
 
 ## 快速安装
 

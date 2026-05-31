@@ -59,9 +59,10 @@ mkdir -p "$INSTALL_DIR/data/configs"
 chmod 750 "$INSTALL_DIR/data"
 chmod +x "$INSTALL_DIR"/*.py "$INSTALL_DIR/vpngw" 2>/dev/null || true
 
-# 命令软链接（统一用 vpngw）
+# 命令软链接（vpngw 和 vg 都可用）
 ln -sf "$INSTALL_DIR/vpngw" /usr/local/bin/vpngw
-chmod +x /usr/local/bin/vpngw
+ln -sf "$INSTALL_DIR/vpngw" /usr/local/bin/vg
+chmod +x /usr/local/bin/vpngw /usr/local/bin/vg
 
 # ── 步骤 4：systemd 服务 ──────────────────────────────────────────────────────
 echo -e "${Y}[4/5] 配置 systemd 服务...${NC}"

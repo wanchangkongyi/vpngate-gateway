@@ -1,4 +1,4 @@
-# VPNGate Gateway v2
+# VPNGate Gateway
 
 将 [VPNGate](https://www.vpngate.net) 免费公共节点作为 VPS 出口 IP，本地暴露 SOCKS5/HTTP 双协议代理供 Xray/3x-ui 使用。出口 IP 持续轮换，SSH 管理流量走 eth0 物理网卡，**不会断连**。
 

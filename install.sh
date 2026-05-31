@@ -1,6 +1,6 @@
 #!/bin/bash
 # VPNGate Gateway v2 安装脚本
-# 用法: bash <(curl -Ls https://raw.githubusercontent.com/wanchangkongyi/vpngate-gateway/main/install.sh)
+# 用法: bash <(curl -Ls https://raw.githubusercontent.com/YOUR_USER/vpngate-gateway/main/install.sh)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -23,34 +23,35 @@ EOF
 echo -e "${NC}"
 
 INSTALL_DIR="/opt/vpngate-gateway"
-GITHUB_REPO="YOUR_USER/vpngate-gateway"   # ← 安装前修改为你的 repo
-GITHUB_URL="https://github.com/${GITHUB_REPO}.git"
+GITHUB_REPO="wanchangkongyi/vpngate-gateway"
 BRANCH="main"
+RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${BRANCH}"
 
 # ── 步骤 1：依赖 ──────────────────────────────────────────────────────────────
 echo -e "${Y}[1/5] 安装系统依赖...${NC}"
 apt-get update -qq
 apt-get install -y -qq \
-    openvpn curl python3 python3-pip \
-    iproute2 iptables net-tools git
+    openvpn curl python3 \
+    iproute2 iptables net-tools
 
 # 检查 openvpn 版本
 OVPN_VER=$(openvpn --version 2>&1 | head -1 | grep -oP '\d+\.\d+' | head -1)
 echo -e "    OpenVPN 版本: ${C}${OVPN_VER}${NC}"
 
-# ── 步骤 2：部署源码 ──────────────────────────────────────────────────────────
-echo -e "${Y}[2/5] 部署源码...${NC}"
-if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "    更新现有安装..."
-    cd "$INSTALL_DIR"
-    git fetch origin -q
-    git reset --hard "origin/${BRANCH}" -q 2>/dev/null || \
-        git reset --hard "origin/master" -q
-else
-    echo "    克隆仓库..."
-    git clone "$GITHUB_URL" "$INSTALL_DIR" -q --branch "$BRANCH" 2>/dev/null || \
-        git clone "$GITHUB_URL" "$INSTALL_DIR" -q
-fi
+# ── 步骤 2：下载源码 ──────────────────────────────────────────────────────────
+echo -e "${Y}[2/5] 下载源码...${NC}"
+mkdir -p "$INSTALL_DIR"
+FILES="vpn_utils.py proxy_server.py vpngate_manager.py vpngw"
+for f in $FILES; do
+    echo -n "    下载 $f ... "
+    if curl -fsSL "${RAW_BASE}/${f}" -o "${INSTALL_DIR}/${f}"; then
+        echo -e "${G}✔${NC}"
+    else
+        echo -e "${R}✘ 失败${NC}"
+        echo -e "${R}请检查网络或仓库地址: ${RAW_BASE}/${f}${NC}"
+        exit 1
+    fi
+done
 
 # ── 步骤 3：目录与权限 ────────────────────────────────────────────────────────
 echo -e "${Y}[3/5] 配置目录与权限...${NC}"

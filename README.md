@@ -89,14 +89,6 @@ vg set probe_count 0           # 跳过握手验证，只用延迟排序
 - SOCKS5：`socks5://127.0.0.1:7928`
 - HTTP：`http://127.0.0.1:7928`
 
-## 服务管理
-
-```bash
-vg restart                          # 重启服务
-vg service                          # 服务管理菜单（含快捷重装）
-systemctl status vpngate-gateway    # 查看服务状态
-journalctl -u vpngate-gateway -f    # 实时查看系统日志
-```
 
 ## 卸载
 

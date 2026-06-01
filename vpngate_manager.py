@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 VPNGate Gateway 核心管理器
-负责：抓节点 / 测速 / OpenVPN连接 / 策略路由 / 自动切换 / 定时轮换
 """
 from __future__ import annotations
 import concurrent.futures
@@ -35,16 +34,17 @@ PROXY_PORT   = 7928
 TUN_DEV      = "tun0"
 ROUTE_TABLE  = 100
 
-_WD_MIN_INTERVAL  = 30
-_WD_MAX_INTERVAL  = 600
-_WD_BACKOFF_MULT  = 2.0
+_WD_MIN_INTERVAL = 30
+_WD_MAX_INTERVAL = 600
+_WD_BACKOFF_MULT = 2.0
 
 # ── 全局状态 ──────────────────────────────────────────────────────────────────
 _lock                         = threading.RLock()
 _active_process: subprocess.Popen | None = None
 _active_node_id: str          = ""
 _is_connecting: bool          = False
-_rotate_timer: threading.Timer | None = None
+_rotate_timer: threading.Timer | None  = None
+_latency_timer: threading.Timer | None = None
 _wd_fail_count: int           = 0
 
 # ── 持久化 ────────────────────────────────────────────────────────────────────
@@ -63,11 +63,13 @@ def _write_json(path: Path, data: Any) -> None:
 # ── 设置 ──────────────────────────────────────────────────────────────────────
 def load_settings() -> dict:
     defaults: dict = {
-        "country_filter": [],
-        "rotate_hours":   2,
-        "top_nodes":      20,
-        "proxy_port":     7928,
-        "probe_count":    10,
+        "country_filter":      [],
+        "rotate_hours":        2,
+        "latency_check_hours": 1,    # 定时延迟检测间隔，0=关闭
+        "min_nodes":           5,    # 节点数低于此值时自动重新抓取
+        "top_nodes":           20,
+        "proxy_port":          7928,
+        "probe_count":         10,
         "auto_fetch_on_start": True,
     }
     saved = _read_json(SETTINGS_FILE, {})
@@ -86,7 +88,6 @@ def save_nodes(nodes: list[dict]) -> None:
 
 def get_state() -> dict:
     s = _read_json(STATE_FILE, {})
-    # 始终从内存变量同步，保证 vpngw 读到最新状态
     s["active_node_id"] = _active_node_id
     s["is_connecting"]  = _is_connecting
     s["pid"]            = os.getpid()
@@ -94,7 +95,7 @@ def get_state() -> dict:
 
 def _update_state(**kw: Any) -> None:
     s = _read_json(STATE_FILE, {})
-    s["active_node_id"] = _active_node_id  # 每次都同步内存变量
+    s["active_node_id"] = _active_node_id
     s["is_connecting"]  = _is_connecting
     s.update(kw)
     _write_json(STATE_FILE, s)
@@ -110,8 +111,7 @@ def log(msg: str) -> None:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with _log_lock:
             if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5 * 1024 * 1024:
-                bak = LOG_FILE.with_suffix(".log.1")
-                LOG_FILE.rename(bak)
+                LOG_FILE.rename(LOG_FILE.with_suffix(".log.1"))
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except Exception:
@@ -124,8 +124,7 @@ def _run(*args: str) -> int:
 def _setup_routing() -> None:
     log(f"[路由] 等待 {TUN_DEV} 就绪...")
     for _ in range(30):
-        r = subprocess.run(["ip", "link", "show", TUN_DEV], capture_output=True)
-        if r.returncode == 0:
+        if subprocess.run(["ip", "link", "show", TUN_DEV], capture_output=True).returncode == 0:
             break
         time.sleep(1)
     else:
@@ -169,13 +168,13 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
 
     cmd = [
         "openvpn",
-        "--config",          str(cfg_path),
-        "--dev",             TUN_DEV,
-        "--dev-type",        "tun",
+        "--config",            str(cfg_path),
+        "--dev",               TUN_DEV,
+        "--dev-type",          "tun",
         "--route-nopull",
         "--connect-retry-max", "1",
-        "--connect-timeout", "20",
-        "--auth-user-pass",  str(AUTH_FILE),
+        "--connect-timeout",   "20",
+        "--auth-user-pass",    str(AUTH_FILE),
         "--auth-nocache",
         "--pull-filter", "ignore", "route-ipv6",
         "--pull-filter", "ignore", "ifconfig-ipv6",
@@ -192,10 +191,10 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
     def _reader() -> None:
         assert proc.stdout
         for line in proc.stdout:
-            stripped = line.rstrip()
-            q.put(stripped)
+            s = line.rstrip()
+            q.put(s)
             if not streaming[0]:
-                log(f"[VPN] {stripped}")
+                log(f"[VPN] {s}")
         q.put(None)
 
     threading.Thread(target=_reader, daemon=True).start()
@@ -207,11 +206,11 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
             line = q.get(timeout=0.5)
         except queue.Empty:
             if proc.poll() is not None:
-                msg = f"进程意外退出（code={proc.returncode}）"
+                msg = f"进程退出（code={proc.returncode}）"
                 break
             continue
         if line is None:
-            msg = "进程退出（无输出）"
+            msg = "进程退出"
             break
         low = line.lower()
         if "initialization sequence completed" in low:
@@ -242,12 +241,14 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
 
     return ok, msg
 
-# ── 节点抓取与测试 ────────────────────────────────────────────────────────────
+# ── 节点抓取 ──────────────────────────────────────────────────────────────────
 def fetch_and_test(
     country_filter: list[str] | None = None,
     top: int = 20,
     probe_count: int = 10,
+    auto_connect_after: bool = False,
 ) -> list[dict]:
+    """抓取节点，直接覆盖现有列表，完成后可自动连接"""
     log("[抓取] 正在获取 VPNGate 节点列表...")
     _update_state(message="正在获取节点列表...", fetching=True)
     try:
@@ -272,11 +273,9 @@ def fetch_and_test(
         [n for n in nodes if n["latency_ms"] > 0],
         key=lambda n: n["latency_ms"]
     )[:top]
-    unreachable_count = len(nodes) - len([n for n in nodes if n["latency_ms"] > 0])
-    log(f"[测速] 可达 {len(reachable)} 个（不可达 {unreachable_count} 个），保留前 {top} 个")
+    log(f"[测速] 可达 {len(reachable)} 个，保留前 {top} 个")
     _update_state(message=f"正在验证 {min(probe_count, len(reachable))} 个节点可用性...")
 
-    # 并发 OpenVPN 握手验证，验证失败的直接剔除
     check_n = min(probe_count, len(reachable))
 
     def _do_probe(n: dict) -> dict:
@@ -293,10 +292,11 @@ def fetch_and_test(
         reachable[:check_n] = probed
         available = sum(1 for n in probed if n["probe_status"] == "available")
         log(f"[握手] 验证完成：{available}/{check_n} 个可用")
-
-    # 剔除握手失败的节点，只保留 available 和 not_checked
-    reachable = [n for n in reachable if n.get("probe_status") != "unavailable"]
-    log(f"[筛选] 剔除不可用节点后剩余 {len(reachable)} 个")
+        if available > 0:
+            reachable = [n for n in reachable if n.get("probe_status") != "unavailable"]
+            log(f"[筛选] 剔除不可用节点后剩余 {len(reachable)} 个")
+        else:
+            log(f"[筛选] 握手全部失败，保留全部 {len(reachable)} 个节点")
 
     vpn_utils.enrich_ip(reachable)
     save_nodes(reachable)
@@ -306,7 +306,96 @@ def fetch_and_test(
         fetched_at=time.time(),
     )
     log(f"[完成] 节点列表已保存，共 {len(reachable)} 个节点")
+
+    if auto_connect_after:
+        log("[抓取] 自动连接最快节点...")
+        ok, msg = auto_connect()
+        log(f"[抓取] 自动连接结果: {msg}")
+
     return reachable
+
+# ── 延迟检测（不抓取，只测现有列表） ─────────────────────────────────────────
+def check_latency() -> tuple[int, int]:
+    """
+    对现有节点列表重新测延迟：
+    - 删除不可达节点
+    - 按延迟重新排序
+    - 节点数不足 min_nodes 时自动触发 fetch_and_test
+    返回 (剩余节点数, 删除节点数)
+    """
+    nodes = get_nodes()
+    if not nodes:
+        log("[延迟检测] 列表为空，触发抓取...")
+        s = load_settings()
+        fetch_and_test(
+            country_filter=s.get("country_filter") or None,
+            top=s.get("top_nodes", 20),
+            probe_count=s.get("probe_count", 10),
+            auto_connect_after=True,
+        )
+        return len(get_nodes()), 0
+
+    log(f"[延迟检测] 开始测试 {len(nodes)} 个节点...")
+    _update_state(message=f"正在检测 {len(nodes)} 个节点延迟...")
+
+    def _do_latency(n: dict) -> dict:
+        n["latency_ms"] = vpn_utils.tcp_latency(n["ip"], n["port"])
+        return n
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as ex:
+        nodes = list(ex.map(_do_latency, nodes))
+
+    reachable = sorted(
+        [n for n in nodes if n["latency_ms"] > 0],
+        key=lambda n: n["latency_ms"]
+    )
+    removed = len(nodes) - len(reachable)
+    log(f"[延迟检测] 删除不可达 {removed} 个，剩余 {len(reachable)} 个")
+
+    s = load_settings()
+    min_nodes = s.get("min_nodes", 5)
+
+    if len(reachable) < min_nodes:
+        log(f"[延迟检测] 节点数 {len(reachable)} < 最低阈值 {min_nodes}，触发重新抓取...")
+        save_nodes(reachable)
+        fetch_and_test(
+            country_filter=s.get("country_filter") or None,
+            top=s.get("top_nodes", 20),
+            probe_count=s.get("probe_count", 10),
+            auto_connect_after=True,
+        )
+        return len(get_nodes()), removed
+
+    save_nodes(reachable)
+    _update_state(message=f"延迟检测完成，剩余 {len(reachable)} 个节点")
+
+    # 如果当前连接节点已被删除，自动切换
+    if _active_node_id and _active_node_id not in {n["id"] for n in reachable}:
+        log(f"[延迟检测] 当前节点已失效，自动切换...")
+        auto_connect()
+
+    return len(reachable), removed
+
+# ── 定时延迟检测 ──────────────────────────────────────────────────────────────
+def _schedule_latency_check() -> None:
+    global _latency_timer
+    with _lock:
+        if _latency_timer:
+            _latency_timer.cancel()
+        s = load_settings()
+        hours = float(s.get("latency_check_hours", 1))
+        if hours <= 0:
+            return
+        _latency_timer = threading.Timer(hours * 3600, _do_latency_check)
+        _latency_timer.daemon = True
+        _latency_timer.start()
+        log(f"[延迟检测] 已设置 {hours:.1f} 小时后自动检测")
+
+def _do_latency_check() -> None:
+    log("[延迟检测] 开始定时检测...")
+    remaining, removed = check_latency()
+    log(f"[延迟检测] 完成，剩余 {remaining} 个节点，删除 {removed} 个")
+    _schedule_latency_check()  # 重新设置下次
 
 # ── 连接管理 ──────────────────────────────────────────────────────────────────
 def connect_node(node_id: str) -> tuple[bool, str]:
@@ -324,7 +413,6 @@ def connect_node(node_id: str) -> tuple[bool, str]:
 
         log(f"[连接] 开始连接: {node_id} ({node.get('country','')} {node.get('ip','')})")
         _update_state(message=f"正在连接 {node_id}...", is_connecting=True)
-
         _stop_openvpn()
         ok, msg = _launch_openvpn(node)
 
@@ -354,21 +442,17 @@ def auto_connect(country: str | None = None) -> tuple[bool, str]:
     nodes = get_nodes()
     if not nodes:
         return False, "没有节点，请先执行 fetch"
-
     if country:
-        country = country.upper()
-        nodes = [n for n in nodes if n.get("country_code") == country]
-        if not nodes:
-            return False, f"没有 {country} 节点"
+        filtered = [n for n in nodes if n.get("country_code") == country.upper()]
+        if not filtered:
+            return False, f"没有 {country.upper()} 节点"
+        nodes = filtered
 
     def _priority(n: dict) -> tuple:
-        s = n.get("probe_status", "not_checked")
         order = {"available": 0, "not_checked": 1, "unavailable": 2}
-        return (order.get(s, 1), n.get("latency_ms") or 9999)
+        return (order.get(n.get("probe_status", "not_checked"), 1), n.get("latency_ms") or 9999)
 
-    candidates = [n for n in nodes if n.get("probe_status") != "unavailable"]
-    if not candidates:
-        candidates = nodes
+    candidates = [n for n in nodes if n.get("probe_status") != "unavailable"] or nodes
     candidates.sort(key=_priority)
     return connect_node(candidates[0]["id"])
 
@@ -376,22 +460,18 @@ def rotate_node() -> tuple[bool, str]:
     nodes = get_nodes()
     if not nodes:
         return False, "没有节点"
-    available = [n for n in nodes if n.get("probe_status") != "unavailable"]
-    if not available:
-        available = nodes
+    available = [n for n in nodes if n.get("probe_status") != "unavailable"] or nodes
     ids = [n["id"] for n in available]
-    if _active_node_id in ids:
-        idx = (ids.index(_active_node_id) + 1) % len(ids)
-    else:
-        idx = 0
+    idx = (ids.index(_active_node_id) + 1) % len(ids) if _active_node_id in ids else 0
     return connect_node(ids[idx])
 
 def disconnect() -> None:
-    global _rotate_timer
+    global _rotate_timer, _latency_timer
     with _lock:
-        if _rotate_timer:
-            _rotate_timer.cancel()
-            _rotate_timer = None
+        for t in [_rotate_timer, _latency_timer]:
+            if t:
+                t.cancel()
+        _rotate_timer = None
     _stop_openvpn()
     nodes = get_nodes()
     for n in nodes:
@@ -406,8 +486,7 @@ def _schedule_rotate() -> None:
     with _lock:
         if _rotate_timer:
             _rotate_timer.cancel()
-        s = load_settings()
-        hours = float(s.get("rotate_hours", 0))
+        hours = float(load_settings().get("rotate_hours", 0))
         if hours <= 0:
             return
         _rotate_timer = threading.Timer(hours * 3600, _do_scheduled_rotate)
@@ -418,7 +497,7 @@ def _schedule_rotate() -> None:
 def _do_scheduled_rotate() -> None:
     log("[轮换] 自动轮换节点...")
     ok, msg = rotate_node()
-    log(f"[轮换] 结果: {'成功' if ok else '失败'} — {msg}")
+    log(f"[轮换] {'成功' if ok else '失败'} — {msg}")
 
 # ── Watchdog ──────────────────────────────────────────────────────────────────
 def _watchdog() -> None:
@@ -439,14 +518,11 @@ def _watchdog() -> None:
         time.sleep(wait)
         interval = min(interval * _WD_BACKOFF_MULT, _WD_MAX_INTERVAL)
         if not _is_connecting:
-            log("[监控] 尝试自动重连...")
             ok, msg = auto_connect()
+            log(f"[监控] 重连{'成功' if ok else '失败'}: {msg}")
             if ok:
-                log(f"[监控] 重连成功: {msg}")
                 _wd_fail_count = 0
                 interval = _WD_MIN_INTERVAL
-            else:
-                log(f"[监控] 重连失败: {msg}")
 
 # ── 命令总线 ──────────────────────────────────────────────────────────────────
 def _cmd_bus() -> None:
@@ -473,11 +549,14 @@ def _cmd_bus() -> None:
                         country_filter=args[0].split(",") if args else s.get("country_filter") or None,
                         top=int(args[1]) if len(args) > 1 else s.get("top_nodes", 20),
                         probe_count=s.get("probe_count", 10),
+                        auto_connect_after=True,
                     )
                     ok, msg = True, f"抓取完成，共 {len(nodes)} 个节点"
+                elif action == "check_latency":
+                    remaining, removed = check_latency()
+                    ok, msg = True, f"检测完成，剩余 {remaining} 个节点，删除 {removed} 个"
                 elif action == "auto_connect":
-                    country = args[0] if args else None
-                    ok, msg = auto_connect(country)
+                    ok, msg = auto_connect(args[0] if args else None)
                 elif action == "connect" and args:
                     ok, msg = connect_node(args[0])
                 elif action == "rotate":
@@ -490,10 +569,7 @@ def _cmd_bus() -> None:
             except Exception as e:
                 msg = str(e)
 
-            _write_json(CMD_RESULT, {
-                "cmd": action, "ok": ok, "msg": msg,
-                "ts": time.time(),
-            })
+            _write_json(CMD_RESULT, {"cmd": action, "ok": ok, "msg": msg, "ts": time.time()})
         except Exception:
             pass
 
@@ -507,12 +583,8 @@ def init() -> None:
     s = load_settings()
     port = s.get("proxy_port", PROXY_PORT)
 
-    threading.Thread(
-        target=proxy_server.start_proxy_server,
-        args=(PROXY_HOST, port),
-        daemon=True,
-        name="proxy-server",
-    ).start()
+    threading.Thread(target=proxy_server.start_proxy_server,
+                     args=(PROXY_HOST, port), daemon=True, name="proxy-server").start()
     log(f"[启动] 代理服务启动 {PROXY_HOST}:{port}")
 
     threading.Thread(target=_watchdog, daemon=True, name="watchdog").start()
@@ -535,13 +607,15 @@ if __name__ == "__main__":
                 country_filter=s.get("country_filter") or None,
                 top=s.get("top_nodes", 20),
                 probe_count=s.get("probe_count", 10),
+                auto_connect_after=True,
             )
-            auto_connect()
         except Exception as e:
             log(f"[启动] 初始化失败: {e}")
-            log("[启动] 服务继续运行，可手动执行 vg fetch && vg auto")
     else:
-        log("[启动] auto_fetch_on_start=false，跳过自动抓取")
+        log("[启动] 跳过自动抓取")
+
+    # 启动定时延迟检测
+    _schedule_latency_check()
 
     while True:
         time.sleep(60)

@@ -46,6 +46,7 @@ _is_connecting: bool          = False
 _rotate_timer: threading.Timer | None  = None
 _latency_timer: threading.Timer | None = None
 _wd_fail_count: int           = 0
+_outlet_fail_count: int       = 0  # 出口连通性连续失败计数
 
 # ── 持久化 ────────────────────────────────────────────────────────────────────
 def _read_json(path: Path, default: Any = None) -> Any:
@@ -71,6 +72,8 @@ def load_settings() -> dict:
         "proxy_port":          7928,
         "probe_count":         10,
         "auto_fetch_on_start": True,
+        "outlet_check_interval": 60,   # 出口连通性检测间隔（秒），0=关闭
+        "outlet_max_fails":     3,     # 连续失败N次后触发轮换
     }
     saved = _read_json(SETTINGS_FILE, {})
     defaults.update(saved)
@@ -369,8 +372,12 @@ def check_latency() -> tuple[int, int]:
     save_nodes(reachable)
     _update_state(message=f"延迟检测完成，剩余 {len(reachable)} 个节点")
 
-    # 如果当前连接节点已被删除，自动切换
-    if _active_node_id and _active_node_id not in {n["id"] for n in reachable}:
+    # 未连接、连接已断、或当前节点被删除 → 自动连接最快节点
+    active_ids = {n["id"] for n in reachable}
+    if not _openvpn_alive():
+        log(f"[延迟检测] 当前未连接，自动连接最快节点...")
+        auto_connect()
+    elif _active_node_id not in active_ids:
         log(f"[延迟检测] 当前节点已失效，自动切换...")
         auto_connect()
 
@@ -505,7 +512,9 @@ def _watchdog() -> None:
     interval = _WD_MIN_INTERVAL
     while True:
         time.sleep(15)
-        if not _active_node_id or _is_connecting:
+        if _is_connecting:
+            continue
+        if not get_nodes():
             continue
         if _openvpn_alive():
             if _wd_fail_count > 0:
@@ -514,7 +523,7 @@ def _watchdog() -> None:
             continue
         _wd_fail_count += 1
         wait = min(interval, _WD_MAX_INTERVAL)
-        log(f"[监控] OpenVPN 进程退出（第 {_wd_fail_count} 次），{wait}s 后重连...")
+        log(f"[监控] VPN 未连接（第 {_wd_fail_count} 次），{wait}s 后重连...")
         time.sleep(wait)
         interval = min(interval * _WD_BACKOFF_MULT, _WD_MAX_INTERVAL)
         if not _is_connecting:
@@ -523,6 +532,64 @@ def _watchdog() -> None:
             if ok:
                 _wd_fail_count = 0
                 interval = _WD_MIN_INTERVAL
+
+# ── 出口连通性检测 ───────────────────────────────────────────────────────────────
+def _check_outlet(port: int, timeout: int = 8) -> bool:
+    """通过代理访问外网，返回是否连通"""
+    try:
+        cmd = ["curl", "-4", "-s", "--proxy", f"socks5h://127.0.0.1:{port}",
+               "https://api.ipify.org", "--max-time", str(timeout)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        return r.returncode == 0 and r.stdout.strip() != ""
+    except Exception:
+        return False
+
+def _outlet_watchdog() -> None:
+    """持续检测出口连通性，失败超过阈值则标记节点不可用并轮换"""
+    global _outlet_fail_count
+    while True:
+        s = load_settings()
+        interval = int(s.get("outlet_check_interval", 60))
+        if interval <= 0:
+            time.sleep(30)
+            continue
+        time.sleep(interval)
+
+        # 没有连接时不检测
+        if not _active_node_id or _is_connecting or not _openvpn_alive():
+            _outlet_fail_count = 0
+            continue
+
+        port = s.get("proxy_port", PROXY_PORT)
+        reachable = _check_outlet(port)
+
+        if reachable:
+            if _outlet_fail_count > 0:
+                log(f"[出口检测] 连通性恢复正常")
+            _outlet_fail_count = 0
+            continue
+
+        _outlet_fail_count += 1
+        max_fails = int(s.get("outlet_max_fails", 3))
+        log(f"[出口检测] 连通性失败（{_outlet_fail_count}/{max_fails}）")
+
+        if _outlet_fail_count >= max_fails:
+            log(f"[出口检测] 连续失败 {_outlet_fail_count} 次，标记节点不可用并轮换...")
+            _outlet_fail_count = 0
+
+            # 标记当前节点为不可用
+            nodes = get_nodes()
+            for n in nodes:
+                if n["id"] == _active_node_id:
+                    n["probe_status"] = "unavailable"
+                    n["probe_message"] = "出口连通性检测失败"
+                    break
+            save_nodes(nodes)
+
+            # 轮换到下一个节点
+            if not _is_connecting:
+                ok, msg = rotate_node()
+                log(f"[出口检测] 轮换结果: {'成功' if ok else '失败'} — {msg}")
 
 # ── 命令总线 ──────────────────────────────────────────────────────────────────
 def _cmd_bus() -> None:
@@ -592,6 +659,9 @@ def init() -> None:
 
     threading.Thread(target=_cmd_bus, daemon=True, name="cmd-bus").start()
     log("[启动] 命令总线已启动")
+
+    threading.Thread(target=_outlet_watchdog, daemon=True, name="outlet-watchdog").start()
+    log("[启动] 出口检测已启动")
 
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

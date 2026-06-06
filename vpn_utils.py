@@ -152,6 +152,7 @@ def _sanitize_config(config: str) -> str:
         lines.append("data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM")
     lines.append("connect-retry-max 1")
     lines.append("resolv-retry 5")
+    lines.append("tls-noverify")
     return "\n".join(lines)
 
 

@@ -152,6 +152,7 @@ def _sanitize_config(config: str) -> str:
         lines.append("data-ciphers AES-128-CBC:AES-256-GCM:AES-128-GCM")
     lines.append("connect-retry-max 1")
     lines.append("resolv-retry 5")
+    lines.append("tls-noverify")
     return "\n".join(lines)
 
 
@@ -224,6 +225,7 @@ def test_openvpn(config_text: str, timeout: int = 18) -> tuple[bool, str]:
         "--connect-timeout", "12",
         "--auth-user-pass", tmp_auth,
         "--auth-nocache",
+        "--capath", "/etc/ssl/certs",
         "--verb", "3",
         "--log", "/dev/null",
     ]

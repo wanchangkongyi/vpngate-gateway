@@ -179,6 +179,7 @@ def _launch_openvpn(node: dict) -> tuple[bool, str]:
         "--connect-timeout",   "20",
         "--auth-user-pass",    str(AUTH_FILE),
         "--auth-nocache",
+        "--capath", "/etc/ssl/certs",
         "--pull-filter", "ignore", "route-ipv6",
         "--pull-filter", "ignore", "ifconfig-ipv6",
         "--verb", "3",
@@ -440,6 +441,13 @@ def connect_node(node_id: str) -> tuple[bool, str]:
         else:
             _update_state(message=f"连接失败: {msg}", is_connecting=False)
             log(f"[连接] 失败: {node_id} — {msg}")
+            # 标记该节点不可用，避免下次 auto_connect 继续选它
+            for n in nodes:
+                if n["id"] == node_id:
+                    n["probe_status"]  = "unavailable"
+                    n["probe_message"] = msg
+                    break
+            save_nodes(nodes)
 
         return ok, msg
     finally:
@@ -459,9 +467,26 @@ def auto_connect(country: str | None = None) -> tuple[bool, str]:
         order = {"available": 0, "not_checked": 1, "unavailable": 2}
         return (order.get(n.get("probe_status", "not_checked"), 1), n.get("latency_ms") or 9999)
 
-    candidates = [n for n in nodes if n.get("probe_status") != "unavailable"] or nodes
+    # 优先选非 unavailable 节点，全部失败则也尝试 unavailable
+    candidates = [n for n in nodes if n.get("probe_status") != "unavailable"]
+    if not candidates:
+        # 所有节点都被标记不可用，重置状态重新尝试
+        log("[连接] 所有节点已标记不可用，重置状态重新尝试...")
+        for n in nodes:
+            n["probe_status"] = "not_checked"
+        save_nodes(nodes)
+        candidates = nodes
+
     candidates.sort(key=_priority)
-    return connect_node(candidates[0]["id"])
+
+    # 逐个尝试直到成功
+    for candidate in candidates:
+        ok, msg = connect_node(candidate["id"])
+        if ok:
+            return ok, msg
+        log(f"[连接] 跳过 {candidate['id']}，尝试下一个...")
+
+    return False, "所有节点连接失败"
 
 def rotate_node() -> tuple[bool, str]:
     nodes = get_nodes()

@@ -346,12 +346,15 @@ SETTINGS_DEF = [
     ("probe_count",          "握手验证数",     "OpenVPN握手验证节点数，0=跳过",              "int"),
     ("proxy_port",           "代理端口",       "SOCKS5/HTTP代理监听端口",                    "int"),
     ("auto_fetch_on_start",  "启动自动抓取",   "服务启动时自动抓取节点 true/false",          "bool"),
+    ("outlet_check_interval", "出口检测间隔",   "秒，0=关闭出口连通性检测",                   "int"),
+    ("outlet_max_fails",      "出口失败阈值",   "连续失败N次后标记节点不可用并轮换",           "int"),
 ]
 
 def cmd_set(args=None, pause=False):
     settings = _read_json(SETTINGS_FILE, {})
     defaults = {"country_filter":[],"rotate_hours":2,"latency_check_hours":1,"min_nodes":5,
-                "top_nodes":20,"probe_count":10,"proxy_port":7928,"auto_fetch_on_start":True}
+                "top_nodes":20,"probe_count":10,"proxy_port":7928,"auto_fetch_on_start":True,
+                "outlet_check_interval":60,"outlet_max_fails":3}
     defaults.update(settings)
 
     key   = getattr(args, "key", None) if args else None
@@ -365,10 +368,10 @@ def cmd_set(args=None, pause=False):
             print(f"  {cyan(str(i))}. {bold(name):<14} = {yellow(str(defaults.get(k,'')))}")
             print(f"     {dim(desc)}")
             print()
-        print(f"  {cyan('00')}. 返回")
+        print(f"  {cyan('0')}. 返回")
         print()
         sel = input("  选择序号: ").strip()
-        if sel == "00" or not sel: return
+        if sel == "0" or not sel: return
         if sel.isdigit() and 1 <= int(sel) <= len(SETTINGS_DEF):
             k, name, desc, typ = SETTINGS_DEF[int(sel)-1]
             key = k
